@@ -23,11 +23,21 @@ def get_platform_prompt(platform: str) -> str:
 
 def get_platform_rules(platform: str) -> Dict[str, Any]:
     sb = get_client()
-    res = sb.table("platform_rules").select("system_prompt,rules,report_url").eq("platform", platform).single().execute()
-    data = res.data
-    if not data:
+    res = sb.table("platform_rules").select("platform, name, rules, instruction_template, tips, report_url, system_prompt, rules_version").eq("platform", platform).single().execute()
+    row = res.data
+    if not row:
         raise ValueError(f"No rules for platform={platform}")
-    return data
+    platform_data = {
+        "platform": row["platform"],
+        "name": row.get("name") or row["platform"],
+        "rules": row.get("rules") or {},
+        "instruction_template": row.get("instruction_template") or "",
+        "tips": row.get("tips") or [],
+        "report_url": row.get("report_url") or "",
+        "system_prompt": row.get("system_prompt") or "",
+        "rules_version": row.get("rules_version") or "",
+    }
+    return platform_data
 
 def log_interaction(tg_user_id: Optional[str], platform: str, input_text: str, output_json: Dict[str, Any]) -> None:
     sb = get_client()

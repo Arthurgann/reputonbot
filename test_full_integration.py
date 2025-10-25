@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backend.services.db import get_platform_prompt
-from backend.services.llm import compose_text
+from backend.services.llm import compose_text_async
 
 def test_full_integration():
     print("Тестируем полную интеграцию...")
@@ -38,7 +38,8 @@ def test_full_integration():
     # 3. Вызываем LLM с инструкцией и текстом жалобы
     print("\n3. Обрабатываем текст с помощью LLM...")
     try:
-        result = compose_text(system_prompt, complaint_text, "e-commerce")
+        import asyncio
+        result = asyncio.run(compose_text_async(system_prompt, complaint_text, "e-commerce", platform_name="wildberries", rules={}, instruction_template="default", tips=[], report_url="test_url"))
         
         print("   [OK] Обработка успешна!")
         print(f"   - Жалоба: {result['complaint'][:100]}...")

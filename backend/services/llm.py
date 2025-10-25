@@ -3,7 +3,22 @@ import httpx
 import json
 from ..config import settings
 
-def compose_text(
+# Global HTTP client for OpenAI with keep-alive and HTTP/2
+_openai_client: httpx.AsyncClient = None
+
+async def get_openai_client() -> httpx.AsyncClient:
+    """Get or create persistent OpenAI HTTP client"""
+    global _openai_client
+    if _openai_client is None or _openai_client.is_closed:
+        _openai_client = httpx.AsyncClient(
+            http2=True,  # Enable HTTP/2
+            timeout=httpx.Timeout(10.0, connect=3.0, read=7.0),  # Optimized timeouts: connect 3s, read 7s
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0),
+            headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"}
+        )
+    return _openai_client
+
+async def compose_text_async(
     system_prompt: str,
     user_text: str,
     business_type: str | None,
@@ -57,22 +72,22 @@ URL для жалоб: {report_url or 'URL не указан'}
     }
     
     try:
-        with httpx.Client(timeout=60) as client:
-            r = client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-            r.raise_for_status()
-            data = r.json()
-            content = data["choices"][0]["message"]["content"]
-            
-            # Try to parse the JSON response
-            parsed_result = json.loads(content)
-            
-            # Validate that required keys are present
-            required_keys = ["complaint", "instruction", "tips"]
-            for key in required_keys:
-                if key not in parsed_result:
-                    raise ValueError(f"Missing required key '{key}' in LLM response")
-                    
-            return parsed_result
+        client = await get_openai_client()
+        r = await client.post("https://api.openai.com/v1/chat/completions", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        content = data["choices"][0]["message"]["content"]
+
+        # Try to parse the JSON response
+        parsed_result = json.loads(content)
+
+        # Validate that required keys are present
+        required_keys = ["complaint", "instruction", "tips"]
+        for key in required_keys:
+            if key not in parsed_result:
+                raise ValueError(f"Missing required key '{key}' in LLM response")
+
+        return parsed_result
     except json.JSONDecodeError:
         # Fallback when LLM returns invalid JSON
         print(f"LLM returned invalid JSON: {content}")

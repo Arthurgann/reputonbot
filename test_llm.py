@@ -6,7 +6,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from backend.services.llm import compose_text
+from backend.services.llm import compose_text_async
 
 def test_llm_service():
     # Example system prompt (this would normally come from Supabase)
@@ -28,7 +28,8 @@ def test_llm_service():
     print("-" * 50)
     
     try:
-        result = compose_text(system_prompt, user_text, "e-commerce")
+        import asyncio
+        result = asyncio.run(compose_text_async(system_prompt, user_text, "e-commerce", platform_name="test", rules={}, instruction_template="default", tips=[], report_url="test_url"))
         print("API call successful!")
         print(f"Complaint: {result['complaint']}")
         print(f"Instruction: {result['instruction']}")

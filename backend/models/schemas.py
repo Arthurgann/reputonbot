@@ -1,11 +1,11 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 
 class ComposeRequest(BaseModel):
     platform: str
     text: str
     business_type: Optional[str] = None
-    tg_user_id: Optional[str] = None
+    tg_user_id: Optional[str] = Field(alias="chat_id", default=None)
 
 class ComposeResponse(BaseModel):
     complaint: str
@@ -17,3 +17,11 @@ class ComposeResponse(BaseModel):
     system_prompt: Optional[str] = None
     rules: Optional[dict] = None
     instruction_template: Optional[str] = None
+
+class StateSetRequest(BaseModel):
+    chat_id: int
+    platform: str
+
+class ComposeFromStateRequest(BaseModel):
+    chat_id: int
+    text: str

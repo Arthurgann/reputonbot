@@ -276,25 +276,30 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/state/set")
-def set_state(req: StateSetRequest, request: Request):
-    """
-    Save chat state with selected platform
-    """
+async def state_set(body: StateSetRequest, request: Request):
+    if not body.platform.strip():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_input", "field": "platform"},
+        )
+    # дальше текущая логика upsert/select и ответ {"status":"ok","chat_id":..., "platform":...}
+    
     try:
         # Extract X-Request-ID from headers
         request_id = request.headers.get("X-Request-ID")
         if request_id:
-            log.info(f"Processing state/set with X-Request-ID: {request_id} for chat_id={req.chat_id}")
+            log.info(f"Processing state/set with X-Request-ID: {request_id} for chat_id={body.chat_id}")
         
         # Get current platform from chat state
-        current_platform = db.get_platform_from_chat_state(req.chat_id)
+        current_platform = db.get_platform_from_chat_state(body.chat_id)
         
         # If the platform is already set to the same value, return success without updating
-        if current_platform and current_platform.strip() == req.platform.strip():
-            return {"status": "ok", "chat_id": req.chat_id, "platform": req.platform}
+        if current_platform and current_platform.strip() == body.platform.strip():
+            return {"status": "ok", "chat_id": body.chat_id, "platform": body.platform}
         
-        db.set_chat_state(req.chat_id, req.platform)
-        return {"status": "ok", "chat_id": req.chat_id, "platform": req.platform}
+        db.set_chat_state(body.chat_id, body.platform)
+        return {"status": "ok", "chat_id": body.chat_id, "platform": body.platform}
     except Exception as e:
         log.exception("set_state failed")
         raise HTTPException(status_code=500, detail=str(e))

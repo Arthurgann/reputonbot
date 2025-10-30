@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional
+from pydantic import model_validator
 
 class ComposeRequest(BaseModel):
     platform: str
@@ -21,6 +22,11 @@ class ComposeResponse(BaseModel):
 class StateSetRequest(BaseModel):
     chat_id: int
     platform: str
+    
+    @model_validator(mode="after")
+    def validate_platform(self):
+        self.platform = self.platform.strip()
+        return self
 
 class ComposeFromStateRequest(BaseModel):
     chat_id: int

@@ -203,3 +203,17 @@ Use these endpoints to verify backend availability after deployment or when debu
   - **429** — лимит запросов на сегодня исчерпан.
 - При включённом `Include Response Headers and Status` (Full Response)
   доступны заголовки (`X-Elapsed-ms`, `X-DB-ms`, `X-LLM-ms`) для логирования производительности.
+
+## Mini QA (local, v0.1.1)
+
+**Result:** ✅ Passed 3/4 base checks + headers
+
+- `/healthz` → **200**, JSON `{"status":"ok","version":"...","db":"ok"}`
+- `/state/set` → **200**, повтор с тем же `X-Request-ID` возвращает **тот же JSON**
+- `/state/set (empty platform)` → **400** `{"error":"invalid_input","field":"platform"}`
+- `/compose_from_state` (empty text) → **400** `{"error":"invalid_input","field":"text","reason":"empty"}`
+- Idempotency `/compose_from_state` (same `X-Request-ID`) → **bit-for-bit same content**, `X-Request-ID` echoed
+- **Timing headers** always present: `X-Request-ID`, `X-Elapsed-ms`, `X-DB-ms`, `X-LLM-ms` (0.0 if no DB/LLM)
+- **Content cache** (by `(chat_id, text_hash, platform)`) — optional; to be enabled in v0.1.2
+
+> Note: Rate-limit 429 may trigger during tests — use another `chat_id`, change text, or lift threshold temporarily.

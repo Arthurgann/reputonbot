@@ -75,17 +75,25 @@ def get_platform_rules(platform: str) -> Dict[str, Any]:
     }
     return platform_data
 
-def log_interaction(tg_user_id: Optional[str], platform: str, input_text: str, output_json: Dict[str, Any], chat_id: Optional[str] = None) -> None:
+def log_interaction(tg_user_id: Optional[str], platform: str, input_text: str, output_json: Dict[str, Any], chat_id: Optional[str] = None, request_id: Optional[str] = None) -> None:
     sb = get_client()
     # Use chat_id if provided, otherwise fall back to tg_user_id if it's numeric
     final_chat_id = chat_id if chat_id is not None else (tg_user_id if tg_user_id and tg_user_id.isdigit() else None)
-    _ = sb.table("interactions").insert({
+    
+    # Prepare the record to insert
+    record = {
         "tg_user_id": tg_user_id,
         "chat_id": final_chat_id,
         "platform": platform,
         "input_text": input_text,
         "output_json": output_json
-    }).execute()
+    }
+    
+    # Add request_id if provided
+    if request_id:
+        record["request_id"] = request_id
+    
+    _ = sb.table("interactions").insert(record).execute()
 
     # Note: Rate limiting counter is incremented here via database insertion
     # The count_interactions_by_chat_id function counts today's records
@@ -166,37 +174,82 @@ def increment_rate_limit(chat_id: int, utc_day: str, threshold: int = 10) -> boo
         log.warning(f"Failed to increment rate limit: {e}")
         return False
 
-def get_cached_request(chat_id: int, utc_day: str, request_id: str) -> Optional[Dict[str, Any]]:
+def get_interaction_by_request_id(request_id: str) -> Optional[Dict[str, Any]]:
     """
-    Get cached response for idempotency check.
-    Returns dict with 'response' and 'status' if found, None otherwise.
+    Get interaction by request_id for idempotency.
+    Returns dict with interaction data if found, None otherwise.
     """
     sb = get_client()
+    
     try:
-        # Try the standard query first
-        res = sb.table("request_cache").select("response, status").eq("chat_id", chat_id).eq("utc_day", utc_day).eq("request_id", request_id).execute()
+        # Query by request_id
+        res = sb.table("interactions").select("*").eq("request_id", request_id).execute()
         if res and res.data and len(res.data) > 0:
             return res.data[0]
         return None
     except Exception as e:
-        log.warning(f"Failed to get cached request: {e}")
+        log.warning(f"Failed to get interaction by request_id: {e}")
         return None
 
-def cache_request(chat_id: int, utc_day: str, request_id: str, response: Dict[str, Any], status: int) -> None:
+def get_cached_request_by_content(chat_id: int, text: str, platform: str) -> Optional[Dict[str, Any]]:
     """
-    Cache response for idempotency.
+    Get cached response by content (chat_id, text, platform) for caching repeated requests.
+    Returns dict with 'response' and 'status' if found, None otherwise.
     """
+    import hashlib
     sb = get_client()
+    # Create hash of the text for comparison
+    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    
+    try:
+        # Query by chat_id, text_hash and platform
+        res = sb.table("request_cache").select("response, status").eq("chat_id", chat_id).eq("text_hash", text_hash).eq("platform", platform).execute()
+        if res and res.data and len(res.data) > 0:
+            return res.data[0]
+        return None
+    except Exception as e:
+        log.warning(f"Failed to get cached request by content: {e}")
+        return None
+
+def cache_request_by_content(chat_id: int, text: str, platform: str, response: Dict[str, Any], status: int = 200) -> None:
+    """
+    Cache response by content (chat_id, text, platform) for caching repeated requests.
+    """
+    import hashlib
+    sb = get_client()
+    # Create hash of the text for comparison
+    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    
     try:
         sb.table("request_cache").upsert({
             "chat_id": chat_id,
-            "utc_day": utc_day,
-            "request_id": request_id,
+            "text_hash": text_hash,
+            "platform": platform,
             "response": response,
             "status": status
         }).execute()
     except Exception as e:
-        log.warning(f"Failed to cache request: {e}")
+        log.warning(f"Failed to cache request by content: {e}")
+
+def cache_request_by_content(chat_id: int, text: str, platform: str, response: Dict[str, Any], status: int) -> None:
+    """
+    Cache response by content (chat_id, text, platform) for caching repeated requests.
+    """
+    import hashlib
+    sb = get_client()
+    # Create hash of the text for comparison
+    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    
+    try:
+        sb.table("request_cache").upsert({
+            "chat_id": chat_id,
+            "text_hash": text_hash,
+            "platform": platform,
+            "response": response,
+            "status": status
+        }).execute()
+    except Exception as e:
+        log.warning(f"Failed to cache request by content: {e}")
 
 def check_and_increment_rate_limit(chat_id: int, threshold: int = 10) -> bool:
     """

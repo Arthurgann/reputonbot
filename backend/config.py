@@ -6,6 +6,7 @@ load_dotenv()
 class Settings:
     APP_ENV = os.getenv("APP_ENV", "dev")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    APP_VERSION = os.getenv("APP_VERSION", "dev")
 
     SUPABASE_URL = os.getenv("SUPABASE_URL", "")
     SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")

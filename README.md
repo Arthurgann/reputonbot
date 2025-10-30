@@ -10,6 +10,52 @@ Backend for the ReputonBot - a Telegram bot that helps users compose complaints 
 - `GET /health` - Health check endpoint
 - `POST /state/set` - Save chat state with selected platform
 - `POST /compose_from_state` - Compose response based on platform stored in chat state
+- `GET /healthz` - Detailed health check endpoint with database connectivity
+- `GET /readyz` - Readiness check endpoint
+
+### Health Check Endpoints
+
+#### `/healthz`
+Detailed health check that verifies application and database status.
+
+**Successful response:**
+```json
+{
+ "status": "ok",
+  "version": "0.1.0",
+  "uptime_s": 123,
+  "db": "ok"
+}
+```
+
+**Failed response (HTTP 503):**
+```json
+{
+  "status": "down",
+  "version": "0.1.0",
+  "uptime_s": 123,
+  "db": "down"
+}
+```
+
+#### `/readyz`
+Readiness check that verifies application is ready to serve requests.
+
+**Successful response:**
+```json
+{
+  "ready": true,
+  "version": "0.1.0"
+}
+```
+
+**Failed response (HTTP 503):**
+```json
+{
+  "ready": false,
+ "version": "0.1.0"
+}
+```
 
 ## Environment Variables
 
@@ -25,7 +71,52 @@ Backend for the ReputonBot - a Telegram bot that helps users compose complaints 
 
 ## Database Setup
 
+**Схема БД: v0.1.1 (schema sync)**
+
 The application uses Supabase as its database. The schema is defined in `supabase_bootstrap.sql`.
+
+### Таблицы
+
+**interactions**: id, tg_user_id, platform, input_text, output_json, created_at, chat_id, request_id (NULL), meta_json (NULL)
+
+**rate_limits**: chat_id, utc_day, hits, threshold (без переименований в этом релизе)
+
+**request_cache**: chat_id, text_hash, platform, response, status, created_at (без поля expires_at)
+
+**chat_state**: chat_id, platform, updated_at
+
+**platform_rules**: id, platform, system_prompt, rules, report_url, created_at
+
+### 🔧 Рекомендуемые поля и индексы (актуально, v0.1.1)
+
+#### interactions
+- Индекс: `interactions_user_time_idx` на (tg_user_id, created_at DESC) — история по пользователю быстро
+- Частичный UNIQUE: `interactions_request_id_uq_partial` (WHERE request_id IS NOT NULL) — идемпотентность платёжных/вебхук-запросов
+- Опционально: `interactions_meta_json_gin` — аналитические фильтры по метаданным
+
+> Примечание: в коде используется `tg_user_id`; в старой документации встречается `telegram_id` — считаем это одним и тем же полем.
+
+#### chat_state
+- Индекс: `chat_state_updated_at_idx` на `updated_at DESC` — уже создан, используется для TTL проверок
+
+#### rate_limits
+- Индексы: `rate_limits_created_at_idx` (на created_at — уже создан), `rate_limits_chat_id_idx` (частые чтения пользователю)
+- Примечание: поле `updated_at` отсутствует — это ок; можно добавить в будущем для служебных задач
+
+#### request_cache
+- Индекс: `request_cache_chat_id_text_hash_platform` на `(chat_id, text_hash, platform)` — для быстрого поиска по содержимому
+- Примечание: поле `expires_at` отсутствует — TTL можно добавить в будущем
+
+#### platform_rules
+- Рекомендация: индекс на `updated_at` (если есть) или оставить без изменений; GIN по `rules_json` добавлять только при реальном поиске по JSON
+
+### Совместимость и план на будущее
+
+- В этом релизе не переименовываем `hits`→`hits_today`
+- `request_id` добавлен в `interactions`, используется для идемпотентности
+- Для `rate_limits` и `request_cache` поля `updated_at` / `expires_at` не добавлялись — это будущий апдейт (TL/сервисные сценарии)
+- Идемпотентность: `X-Request-ID` → `interactions.request_id`
+- Ускорение повторов: кэш по содержимому (`chat_id,text_hash,platform`) → `request_cache`
 
 ## New State-Based Flow
 
@@ -80,3 +171,35 @@ The application is built with FastAPI and follows a modular structure:
 - `models/` - Pydantic models
 - `services/` - Business logic and database operations
 - `routes/` - Additional routes (if any)
+
+## 🔍 Health & Readiness
+
+The backend provides two diagnostic endpoints for deployment and monitoring:
+
+- **GET `/healthz`** — returns the current app and database status.  
+  Example:
+
+  ```json
+  {"status":"ok","version":"0.1.0","db":"ok","uptime_s":120}
+
+  Fields:
+  status — "ok" or "down"
+  db — "ok" if Supabase responds, "down" otherwise
+  version — value from APP_VERSION in .env
+  uptime_s — seconds since application startup
+
+- **GET `/readyz`** — indicates whether the service is ready to handle requests.
+  Currently duplicates /healthz, but later may include cache warm-up checks.
+
+Use these endpoints to verify backend availability after deployment or when debugging integration issues with n8n or Supabase.
+
+## Client Expectations (n8n Integration)
+
+- Клиент (n8n) передаёт заголовок `X-Request-ID` в `/state/set` и `/compose_from_state`
+  — любой уникальный идентификатор выполнения workflow.
+- Клиент обрабатывает статус-коды:
+  - **200** — успешный ответ,
+  - **409** — не выбрана или устарела платформа,
+  - **429** — лимит запросов на сегодня исчерпан.
+- При включённом `Include Response Headers and Status` (Full Response)
+  доступны заголовки (`X-Elapsed-ms`, `X-DB-ms`, `X-LLM-ms`) для логирования производительности.

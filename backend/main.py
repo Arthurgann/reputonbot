@@ -25,36 +25,30 @@ except Exception:
 app = FastAPI(title="ReputonBot Backend", version="0.2.0")
 
 # Profiling middleware
+import time
+from time import perf_counter
+
 @app.middleware("http")
 async def add_timing_headers(request: Request, call_next):
-    start_time = time.time()
+    # Read/generate request_id and put in request.state.request_id
+    request_id = request.headers.get("X-Request-ID")
+    if not request_id:
+        import uuid
+        request_id = str(uuid.uuid4())
+    request.state.request_id = request_id
     
     # Initialize timing values
-    request.state.db_time_ms = 0
-    request.state.llm_time_ms = 0
+    request.state.db_ms = 0.0
+    request.state.llm_ms = 0.0
+    t0 = perf_counter()
     
     response = await call_next(request)
     
-    # Calculate total elapsed time
-    elapsed_ms = (time.time() - start_time) * 1000
-    
     # Add timing headers to response
-    response.headers["X-Elapsed-ms"] = f"{elapsed_ms:.1f}"
-    
-    if hasattr(request.state, 'db_time_ms') and request.state.db_time_ms > 0:
-        response.headers["X-DB-ms"] = f"{request.state.db_time_ms:.1f}"
-    
-    if hasattr(request.state, 'llm_time_ms') and request.state.llm_time_ms > 0:
-        response.headers["X-LLM-ms"] = f"{request.state.llm_time_ms:.1f}"
-    
-    # Always add X-Request-ID - echo if present or add generated one
-    request_id = request.headers.get("X-Request-ID")
-    if not request_id:
-        # Generate a request ID if not provided
-        import uuid
-        request_id = str(uuid.uuid4())
-    
-    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Request-ID"] = request.state.request_id
+    response.headers["X-Elapsed-ms"] = f"{(perf_counter()-t0)*1000:.1f}"
+    response.headers["X-DB-ms"] = f"{getattr(request.state,'db_ms',0.0):.1f}"
+    response.headers["X-LLM-ms"] = f"{getattr(request.state,'llm_ms',0.0):.1f}"
     
     return response
 
@@ -344,18 +338,29 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
             # Generate a request ID if not provided
             import uuid
             request_id = str(uuid.uuid4())
-            log.info(f"No X-Request-ID header for chat_id={req.chat_id}, generated: {request_id}")
-        else:
-            log.info(f"Processing request with X-Request-ID: {request_id} for chat_id={req.chat_id}")
+        # Store request_id in request.state for middleware-echo
+        request.state.request_id = request_id
+
+        # Read chat_id and text from request body
+        chat_id = req.chat_id
+        text = req.text
+
+        # Validate text input
+        if text is None or text.strip() == "":
+            raise HTTPException(400, detail={"error": "invalid_input", "field": "text", "reason": "empty"})
+        
+        MAX_TEXT_LEN = 6000
+        if len(text) > MAX_TEXT_LEN:
+            raise HTTPException(400, detail={"error": "invalid_input", "field": "text", "reason": "too_long", "limit": 6000})
 
         # TTL check for platform selection
         TTL = dt.timedelta(hours=24)
 
         # Get platform and updated_at from chat state using optimized query
-        row = db.get_chat_state_with_updated_at(req.chat_id)
+        row = db.get_chat_state_with_updated_at(chat_id)
 
         if not row or not row.get("platform"):
-            log.info(f"compose check | chat_id={req.chat_id} | platform=None | chosen_at=None | now=None | zone=None | decision=no_platform")
+            log.info(f"compose check | chat_id={chat_id} | platform=None | chosen_at=None | now=None | zone=None | decision=no_platform")
             raise HTTPException(status_code=409, detail={"error": "no_platform"})
 
         platform = row["platform"].strip()  # Clean platform value
@@ -363,12 +368,12 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
 
         # Ensure we have updated_at
         if not updated_at_str:
-            log.info(f"compose check | chat_id={req.chat_id} | platform={platform} | chosen_at=None | now=None | zone=None | decision=no_updated_at")
+            log.info(f"compose check | chat_id={chat_id} | platform={platform} | chosen_at=None | now=None | zone=None | decision=no_updated_at")
             raise HTTPException(status_code=409, detail={"error": "platform_expired"})
 
         ts = ensure_utc(updated_at_str)
         if not ts:
-            log.info(f"compose check | chat_id={req.chat_id} | platform={platform} | chosen_at={updated_at_str} | now=None | zone=None | decision=invalid_timestamp")
+            log.info(f"compose check | chat_id={chat_id} | platform={platform} | chosen_at={updated_at_str} | now=None | zone=None | decision=invalid_timestamp")
             raise HTTPException(status_code=409, detail={"error": "platform_expired"})
 
         now = dt.datetime.now(dt.timezone.utc)
@@ -376,7 +381,7 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
 
         # Log the decision
         decision = "expired" if is_expired else "ok"
-        log.info(f"compose check | chat_id={req.chat_id} | platform={platform} | chosen_at={ts.isoformat()} | now={now.isoformat()} | zone=UTC | decision={decision}")
+        log.info(f"compose check | chat_id={chat_id} | platform={platform} | chosen_at={ts.isoformat()} | now={now.isoformat()} | zone=UTC | decision={decision}")
 
         if is_expired:
             raise HTTPException(status_code=409, detail={"error": "platform_expired"})
@@ -390,12 +395,6 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         now_utc = dt.datetime.now(dt.timezone.utc)
         utc_day = now_utc.date().isoformat()
 
-        # Extract X-Request-ID from headers
-        request_id = request.headers.get("X-Request-ID")
-        if not request_id:
-            # Generate a request ID if not provided
-            import uuid
-            request_id = str(uuid.uuid4())
         
         # Check idempotency first: interactions.request_id
         cached_interaction = db.get_interaction_by_request_id(request_id)

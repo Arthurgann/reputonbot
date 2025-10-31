@@ -5,10 +5,6 @@ from supabase import create_client, Client
 from .logger import log
 from ..config import settings
 import asyncio
-from datetime import datetime, timezone
-
-# Module-level Supabase client
-sb: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
 
 _client: Optional[Client] = None
 _platform_rules_cache: Optional[Dict[str, Dict[str, Any]]] = None
@@ -112,39 +108,35 @@ async def get_platform_rules(platform: str) -> Dict[str, Any]:
     }
     return platform_data
 
-def log_interaction(chat_id: int, platform: str, input_text: str, output_json: dict, *, request_id: str | None = None, meta: dict | None = None):
-    payload = {
-        "chat_id": chat_id,
+async def log_interaction(tg_user_id: Optional[str], platform: str, input_text: str, output_json: Dict[str, Any], chat_id: Optional[str] = None, request_id: Optional[str] = None) -> None:
+    sb = get_client()
+    # Use chat_id if provided, otherwise fall back to tg_user_id if it's numeric
+    final_chat_id = chat_id if chat_id is not None else (tg_user_id if tg_user_id and tg_user_id.isdigit() else None)
+    
+    # Prepare the record to insert
+    record = {
+        "tg_user_id": tg_user_id,
+        "chat_id": final_chat_id,
         "platform": platform,
         "input_text": input_text,
-        "output_json": output_json,
-        "request_id": request_id,
-        "meta_json": meta or {},
+        "output_json": output_json
     }
+    
+    # Add request_id if provided
+    if request_id:
+        record["request_id"] = request_id
+    
     try:
-        res = sb.table("interactions").insert(payload).execute()
-        return res
-    except Exception as e:
-        log.warning("log_interaction failed: %s", e)
-        return None
+        _ = await asyncio.wait_for(
+            asyncio.to_thread(lambda: sb.table("interactions").insert(record).execute()),
+            timeout=3.0
+        )
+    except asyncio.TimeoutError:
+        log.warning("log_interaction: Supabase insert timed out")
+        return
 
-def upsert_chat_state(chat_id: int, platform: str):
-    try:
-        ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-        payload = {
-            "chat_id": chat_id,
-            "platform": platform,
-            "updated_at": ts,
-        }
-        res = sb.table("chat_state").upsert(
-            payload,
-            on_conflict="chat_id",     # ЯВНО, либо можно вообще убрать этот параметр
-            returning="minimal"        # чтобы ответ был компактным
-        ).execute()
-        return res
-    except Exception as e:
-        log.exception("db.upsert_chat_state failed: %s", e)
-        return None
+    # Note: Rate limiting counter is incremented here via database insertion
+    # The count_interactions_by_chat_id function counts today's records
 
 async def set_chat_state(chat_id: int, platform: str) -> None:
     """
@@ -165,31 +157,42 @@ async def set_chat_state(chat_id: int, platform: str) -> None:
         log.warning(f"set_chat_state: Supabase upsert timed out for chat_id={chat_id}")
         return
 
-def get_platform_from_chat_state(chat_id: int):
-    row = get_chat_state_with_updated_at(chat_id)
-    if not row:
-        return None
-    if isinstance(row, dict):
-        return row.get("platform")
-    if isinstance(row, list) and row:
-        item = row[0]
-        return item.get("platform") if isinstance(item, dict) else None
-    return None
-
-def get_chat_state_with_updated_at(chat_id: int):
+async def get_platform_from_chat_state(chat_id: int) -> Optional[str]:
+    """
+    Get platform from chat state
+    """
+    sb = get_client()
+    t0 = time.perf_counter()
     try:
-        res = sb.table("chat_state") \
-            .select("platform, updated_at") \
-            .eq("chat_id", chat_id) \
-            .maybe_single() \
-            .execute()
-        if res and res.data:
-            data = res.data[0] if isinstance(res.data, list) and len(res.data) > 0 else res.data
-            return data
+        res = await asyncio.wait_for(
+            asyncio.to_thread(lambda: sb.table("chat_state").select("platform").eq("chat_id", chat_id).single().execute()),
+            timeout=2.0
+        )
+    except asyncio.TimeoutError:
+        log.warning(f"get_platform_from_chat_state: Supabase query timed out for chat_id={chat_id}")
         return None
-    except Exception as e:
-        log.exception("db.get_chat_state_with_updated_at failed: %s", e)
+    dt_ms = (time.perf_counter() - t0) * 1000
+    if dt_ms > 2000:
+        log.warning("DB slow: get_platform_from_chat_state took %.1f ms", dt_ms)
+    data = res.data if res else None
+    if not data or "platform" not in data:
         return None
+    return data["platform"]
+
+async def get_chat_state_with_updated_at(chat_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Get chat state with updated_at for TTL check (optimized query)
+    """
+    sb = get_client()
+    try:
+        res = await asyncio.wait_for(
+            asyncio.to_thread(lambda: sb.table("chat_state").select("platform, updated_at").eq("chat_id", chat_id).maybe_single().execute()),
+            timeout=2.0
+        )
+    except asyncio.TimeoutError:
+        log.warning(f"get_chat_state_with_updated_at: Supabase query timed out for chat_id={chat_id}")
+        return None
+    return res.data if res else None
 
 def count_interactions_by_chat_id(chat_id: int) -> int:
     """
@@ -334,82 +337,6 @@ def cache_request_by_content(chat_id: int, text: str, platform: str, response: D
         dt_ms = (time.perf_counter() - t0) * 1000
         if dt_ms > 3000:
             log.warning("DB slow: cache_request_by_content took %.1f ms", dt_ms)
-    except Exception as e:
-        log.warning(f"Failed to cache request by content: {e}")
-
-def get_cached_by_content(chat_id: int, text_hash: str, platform: str):
-    try:
-        q = sb.table("request_cache_content") \
-              .select("result_json, created_at, expires_at") \
-              .eq("chat_id", chat_id) \
-              .eq("text_hash", text_hash) \
-              .eq("platform", platform) \
-              .maybe_single()
-        res = q.execute()
-        return res.data or None
-    except Exception as e:
-        # Фолбэк на случай 406 или «object not single»
-        try:
-            q2 = sb.table("request_cache_content") \
-                   .select("result_json, created_at, expires_at") \
-                   .eq("chat_id", chat_id) \
-                   .eq("text_hash", text_hash) \
-                   .eq("platform", platform) \
-                   .limit(1)
-            res2 = q2.execute()
-            rows = res2.data or []
-            return rows[0] if rows else None
-        except Exception as e2:
-            log.warning("get_cached_by_content fallback failed: %s", e2)
-            return None
-
-def cache_request_by_content_new(chat_id: int, text: str, platform: str, result: Dict[str, Any]) -> None:
-    """
-    Cache response by content (chat_id, text, platform) to correct table.
-    """
-    import hashlib
-    import datetime as dt
-    sb = get_client()
-    # Create hash of the text for comparison
-    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-    
-    t0 = time.perf_counter()
-    try:
-        sb.table("request_cache_content").upsert({
-            "chat_id": chat_id,
-            "text_hash": text_hash,
-            "platform": platform,
-            "result_json": result,
-            "created_at": dt.datetime.now(dt.timezone.utc).isoformat()
-        }).execute()
-        dt_ms = (time.perf_counter() - t0) * 100
-        if dt_ms > 3000:
-            log.warning("DB slow: cache_request_by_content_new took %.1f ms", dt_ms)
-    except Exception as e:
-        log.warning(f"Failed to cache request by content: {e}")
-
-def cache_request_by_content_error(chat_id: int, text: str, platform: str, result: Dict[str, Any]) -> None:
-    """
-    Cache error response by content (chat_id, text, platform) to correct table.
-    """
-    import hashlib
-    import datetime as dt
-    sb = get_client()
-    # Create hash of the text for comparison
-    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-    
-    t0 = time.perf_counter()
-    try:
-        sb.table("request_cache_content").upsert({
-            "chat_id": chat_id,
-            "text_hash": text_hash,
-            "platform": platform,
-            "result_json": result,
-            "created_at": dt.datetime.now(dt.timezone.utc).isoformat()
-        }).execute()
-        dt_ms = (time.perf_counter() - t0) * 1000
-        if dt_ms > 3000:
-            log.warning("DB slow: cache_request_by_content_error took %.1f ms", dt_ms)
     except Exception as e:
         log.warning(f"Failed to cache request by content: {e}")
 

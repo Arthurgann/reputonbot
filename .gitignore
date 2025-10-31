@@ -15,8 +15,3 @@ Thumbs.db
 
 # Docker
 *.log
-
-# Env variants (do not commit env files)
-.env.*
-.env.local
-.env.prod

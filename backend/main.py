@@ -3,21 +3,17 @@ import platform
 import re
 import time
 import asyncio
-import inspect
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from .models.schemas import ComposeRequest, ComposeResponse, StateSetRequest
+from .models.schemas import ComposeRequest, ComposeResponse, StateSetRequest, ComposeFromStateRequest
 from . import services
 from .services import db, llm
-from hashlib import sha256
 from .services.logger import log
 from .services.probability import score_probability
 from backend.services.db import get_client
-def clean_str(v):
-    return v.strip() if isinstance(v, str) else ""
 
 
 # Use uvloop for better async performance (only on non-Windows systems)
@@ -36,25 +32,6 @@ from time import perf_counter
 
 @app.middleware("http")
 async def add_timing_headers(request: Request, call_next):
-    # Add ERROR log at the very top of middleware
-    log.error("mw: got %s %s", request.method, request.url.path)
-    
-    # Diagnostic shortcut - check for x-cfs-echo header before call_next
-    if request.headers.get("x-cfs-echo") == "1" and request.url.path == "/compose_from_state":
-        # Set the same headers that middleware normally sets
-        resp = JSONResponse({"ok": True, "stage": "middleware"}, status_code=200)
-        import uuid
-        request_id = request.headers.get("X-Request-ID")
-        if not request_id:
-            request_id = str(uuid.uuid4())
-        resp.headers["X-Request-ID"] = request_id
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["Referrer-Policy"] = "no-referrer"
-        resp.headers["X-Elapsed-ms"] = "0.0"
-        resp.headers["X-DB-ms"] = "0.0"
-        resp.headers["X-LLM-ms"] = "0.0"
-        return resp
-    
     # Read/generate request_id and put in request.state.request_id
     request_id = request.headers.get("X-Request-ID")
     if not request_id:
@@ -69,14 +46,8 @@ async def add_timing_headers(request: Request, call_next):
     
     try:
         response = await asyncio.wait_for(call_next(request), timeout=30.0)
-        # Add security headers to response
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
     except asyncio.TimeoutError:
-        response = JSONResponse(status_code=503, content={"error": "busy", "message": "service timeout"})
-        # Add security headers to response
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        return JSONResponse(status_code=503, content={"error": "busy", "message": "service timeout"})
     
     # Add timing headers to response
     response.headers["X-Request-ID"] = request.state.request_id
@@ -91,18 +62,6 @@ async def add_timing_headers(request: Request, call_next):
 async def startup_event():
     """Preload platform rules on startup"""
     import time
-    from .config import settings, get_log_level
-    from .services.logger import log
-    import logging
-    
-    # Configure logging level based on environment
-    root_logger = logging.getLogger()
-    root_logger.setLevel(get_log_level())
-    log.setLevel(get_log_level())
-    
-    # Log the environment and logging level at startup
-    log.info(f"Starting application in {settings.APP_ENV} environment with log level {logging.getLevelName(get_log_level())}")
-    
     app.state.start_time = time.time()
     await db.preload_platform_rules()
     # Start background task to refresh cache every 5 minutes
@@ -202,7 +161,7 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     # Remove links from text
     text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
     text = re.sub(r'www\.(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
-    text = clean_str(text)
+    text = text.strip()
 
     # Get platform rules from cache (fast)
     platform_data = db.get_platform_rules_cached(platform)
@@ -243,7 +202,7 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
 
     # Log the interaction (moved after LLM call for performance)
     try:
-        db.log_interaction(chat_id, platform, text, result, request_id=request_id)
+        db.log_interaction(chat_id, platform, text, result, chat_id=chat_id if chat_id else None, request_id=request_id)
     except Exception as e:
         log.warning(f"log_interaction failed: {e}")
 
@@ -269,20 +228,14 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
         
         # Check content cache: (chat_id, text_hash, platform)
         try:
-            import hashlib
-            text_sha = hashlib.sha256(req.text.encode('utf-8')).hexdigest()
-            hit, payload = False, None
-            if CONTENT_CACHE_ENABLED:
-                row = db.get_cached_by_content(req.tg_user_id, text_sha, req.platform)
-                hit = bool(row)
-                payload = row["result_json"] if row else None
-            else:
-                hit, payload = False, None
-            log.info(f"compose cache | content hit={hit} | chat_id={req.tg_user_id} | platform={req.platform}")
-            if hit and payload:
+            cached = db.get_cached_request_by_content(req.tg_user_id, req.text, req.platform)
+            log.info(f"compose cache | content hit={cached is not None} | chat_id={req.tg_user_id} | platform={req.platform}")
+            if cached:
                 # Return cached response
-                return ComposeResponse(**payload)
-            # If we have a row but no result_json, continue without cache
+                if cached["status"] == 200:
+                    return ComposeResponse(**cached["response"])
+                else:
+                    raise HTTPException(status_code=cached["status"], detail=cached["response"])
         except Exception as e:
             log.warning(f"Failed to check content cache: {e}")
             # Continue without content caching
@@ -291,86 +244,49 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
         
         # Log the interaction with request_id for idempotency
         try:
-            db.log_interaction(req.tg_user_id, req.platform, req.text, result, request_id=request_id)
+            db.log_interaction(req.tg_user_id, req.platform, req.text, result, chat_id=req.tg_user_id, request_id=request_id)
         except Exception as e:
             log.warning(f"log_interaction failed: {e}")
-
+        
         # Also cache by content for future requests with different request_id but same content
-        if CONTENT_CACHE_ENABLED:
-            try:
-                db.cache_request_by_content_new(req.tg_user_id, text_hash, req.platform, result, ttl_seconds=3600)
-            except Exception as e:
-                log.warning(f"Failed to cache request by content: {e}")
+        try:
+            db.cache_request_by_content(req.tg_user_id, req.text, req.platform, result, 200)
+        except Exception as e:
+            log.warning(f"Failed to cache request by content: {e}")
         
         return ComposeResponse(**result)
     except Exception as e:
-        text_len = len(req.text) if hasattr(req, 'text') else 0
-        text_sha = sha256(req.text.encode()).hexdigest()[:12] if hasattr(req, 'text') else ""
-        log.exception(f"compose failed | text_len={text_len} | text_sha={text_sha} | platform={req.platform} | chat_id={req.tg_user_id}")
+        log.exception("compose failed")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/state/set")
-async def state_set(request: Request):
-    # Read request body
-    data = await request.json()
-    
-    # Safely extract fields
-    chat_id_raw = data.get("chat_id")
-    try:
-        chat_id = int(chat_id_raw)
-    except Exception:
-        chat_id = 0
-    platform = clean_str(data.get("platform"))
-    username = clean_str(data.get("username"))
-    
-    # Validation
-    if not platform:
+async def state_set(body: StateSetRequest, request: Request):
+    if not body.platform.strip():
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_input", "field": "platform"},
         )
-    
-    if chat_id <= 0:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(
-            status_code=400,
-            content={"error": "invalid_input", "field": "chat_id"},
-        )
-    
     # дальше текущая логика upsert/select и ответ {"status":"ok","chat_id":..., "platform":...}
     
     try:
         # Extract X-Request-ID from headers
         request_id = request.headers.get("X-Request-ID")
         if request_id:
-            log.info(f"Processing state/set with X-Request-ID: {request_id} for chat_id={chat_id}")
+            log.info(f"Processing state/set with X-Request-ID: {request_id} for chat_id={body.chat_id}")
         
         # Get current platform from chat state
-        platform_db = db.get_platform_from_chat_state(chat_id)
-        if not platform:
-            platform = clean_str(platform_db)
+        current_platform = db.get_platform_from_chat_state(body.chat_id)
         
         # If the platform is already set to the same value, return success without updating
-        if platform_db and clean_str(platform_db) == platform:
-            return {"status": "ok", "chat_id": chat_id, "platform": platform}
+        if current_platform and current_platform.strip() == body.platform.strip():
+            return {"status": "ok", "chat_id": body.chat_id, "platform": body.platform}
         
-        res = db.upsert_chat_state(chat_id, platform)
-        log.error("state_set: upsert type=%s data=%r",
-                  type(res).__name__ if res else None,
-                  getattr(res, "data", None))
-        return {"status": "ok", "chat_id": chat_id, "platform": platform}
-    except HTTPException:
-        raise
+        db.set_chat_state(body.chat_id, body.platform)
+        return {"status": "ok", "chat_id": body.chat_id, "platform": body.platform}
     except Exception as e:
-        log.exception("state_set failed: type(platform)=%s type(username)=%s", type(platform).__name__, type(username).__name__)
+        log.exception("set_state failed")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/__debug/chat_state")
-async def __debug_chat_state(chat_id: int):
-    from backend.services import db
-    row = db.get_chat_state_with_updated_at(chat_id)
-    return {"row": row}
 
 import datetime as dt
 
@@ -399,58 +315,11 @@ def ensure_utc(dtval):
     return None
 
 @app.post("/compose_from_state", response_model=ComposeResponse)
-async def compose_from_state(request: Request):
+async def compose_from_state(req: ComposeFromStateRequest, request: Request):
     """
     Compose response based on platform stored in chat state (fully async)
     """
-    import os
-    CONTENT_CACHE_ENABLED = os.getenv("CONTENT_CACHE_ENABLED", "1") == "1"
-    
     start_time = time.time()
-    log.error("cfs: ENTER")
-    
-    # Diagnostic handler shortcut - after first log and validations, before any await
-    try:
-        # Parse request body for validation
-        try:
-            data = await request.json()
-        except Exception as e:
-            log.exception("cfs: json parse failed: %s", e)
-            raise HTTPException(status_code=400, detail={"error":"invalid_json"})
-        
-        # Extract fields safely for validation
-        chat_id_raw = data.get("chat_id")
-        try:
-            chat_id = int(chat_id_raw)
-        except Exception:
-            chat_id = 0
-        text = clean_str(data.get("text"))
-        
-        # Validation before any other logic
-        if chat_id <= 0:
-            raise HTTPException(400, {"error":"invalid_input","field":"chat_id"})
-        
-        if text == "":
-            log.warning("invalid_input compose_from_state: text_len=%d text_sha=%s platform=%s chat_id=%s",
-                        0, sha256(b"").hexdigest()[:12], None, chat_id)
-            raise HTTPException(400, {"error":"invalid_input","field":"text","reason":"empty"})
-        
-        if len(text) > 10000:
-            log.warning("invalid_input compose_from_state: text_len=%d text_sha=%s platform=%s chat_id=%s",
-                        len(text), sha256(text.encode()).hexdigest()[:12], None, chat_id)
-            raise HTTPException(400, {"error":"invalid_input","field":"text","reason":"too_long"})
-        
-        # Handler diagnostic return - after validation but before any await
-        if request.headers.get("x-cfs-echo") == "1":
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"ok": True, "stage": "handler-pre-parse"}, status_code=200)
-    
-    except HTTPException:
-        raise
-    except Exception:
-        # If there's an error during validation, let the main try/catch handle it
-        pass
-    
     try:
         # Extract X-Request-ID from headers
         request_id = request.headers.get("X-Request-ID")
@@ -461,86 +330,29 @@ async def compose_from_state(request: Request):
         # Store request_id in request.state for middleware-echo
         request.state.request_id = request_id
 
-        # Add log before JSON parsing
-        log.error("cfs: BEFORE JSON")
-        
-        # Parse request body
-        try:
-            data = await request.json()
-        except Exception as e:
-            log.exception("cfs: json parse failed: %s", e)
-            raise HTTPException(status_code=400, detail={"error":"invalid_json"})
-        
-        # Add log after JSON parsing
-        log.error("cfs: AFTER JSON type=%s keys=%s", type(data).__name__, list(data.keys()) if isinstance(data, dict) else None)
-        
-        # Extract fields safely
-        chat_id_raw = data.get("chat_id")
-        try:
-            chat_id = int(chat_id_raw)
-        except Exception:
-            chat_id = 0
-        text = clean_str(data.get("text"))
-        
-        log.info("cfs: parsed chat_id=%s text_len=%d", chat_id, len(text))
-        
-        # Validation before any other logic
-        if chat_id <= 0:
-            raise HTTPException(400, {"error":"invalid_input","field":"chat_id"})
-        
-        if text == "":
-            log.warning("invalid_input compose_from_state: text_len=%d text_sha=%s platform=%s chat_id=%s",
-                        0, sha256(b"").hexdigest()[:12], None, chat_id)
-            raise HTTPException(400, {"error":"invalid_input","field":"text","reason":"empty"})
-        
-        if len(text) > 10000:
-            log.warning("invalid_input compose_from_state: text_len=%d text_sha=%s platform=%s chat_id=%s",
-                        len(text), sha256(text.encode()).hexdigest()[:12], None, chat_id)
-            raise HTTPException(400, {"error":"invalid_input","field":"text","reason":"too_long"})
+        # Read chat_id and text from request body
+        chat_id = req.chat_id
+        text = req.text
 
-        # Get platform from state
-        log.error("cfs: BEFORE AWAIT get_platform chat_id=%s", chat_id)
-        platform_db = db.get_platform_from_chat_state(chat_id)   # Синхронный вызов
-        log.error("cfs: AFTER AWAIT get_platform type=%s value=%r", type(platform_db).__name__, platform_db)
+        # Validate text input
+        if text is None or text.strip() == "":
+            raise HTTPException(400, detail={"error": "invalid_input", "field": "text", "reason": "empty"})
         
-        # диагностический лог типов
-        log.error("cfs: types before guard: platform_db=%s", type(platform_db).__name__)
-
-        # дефенсив-гард на случай, если всё ещё пришла корутина
-        if inspect.iscoroutine(platform_db):
-            log.error("cfs: platform_db is coroutine — awaiting it (defensive)")
-            platform_db = await platform_db
-
-        # и сразу после — ещё один лог
-        log.error("cfs: types after guard: platform_db=%s", type(platform_db).__name__)
-
-        platform_safe = clean_str(platform_db)
+        MAX_TEXT_LEN = 6000
+        if len(text) > MAX_TEXT_LEN:
+            raise HTTPException(400, detail={"error": "invalid_input", "field": "text", "reason": "too_long", "limit": 6000})
 
         # TTL check for platform selection
         TTL = dt.timedelta(hours=24)
 
-        # Add log before database query
-        log.error("cfs: BEFORE AWAIT get_chat_state_with_updated_at chat_id=%s", chat_id)
         # Get platform and updated_at from chat state using optimized query
         row = db.get_chat_state_with_updated_at(chat_id)
-        log.error("cfs: AFTER AWAIT get_chat_state_with_updated_at row=%s", row)
-        
-        # диагностический лог типов для row
-        log.error("cfs: types before guard: row=%s", type(row).__name__)
-
-        # дефенсив-гард на случай, если всё ещё пришла корутина
-        if inspect.iscoroutine(row):
-            log.error("cfs: row is coroutine — awaiting it (defensive)")
-            row = await row
-
-        # и сразу после — ещё один лог
-        log.error("cfs: types after guard: row=%s", type(row).__name__)
 
         if not row or not row.get("platform"):
             log.info(f"compose check | chat_id={chat_id} | platform=None | chosen_at=None | now=None | zone=None | decision=no_platform")
             raise HTTPException(status_code=409, detail={"error": "no_platform"})
 
-        platform = clean_str(row["platform"])  # Clean platform value
+        platform = row["platform"].strip()  # Clean platform value
         updated_at_str = row.get("updated_at")
 
         # Ensure we have updated_at
@@ -564,6 +376,7 @@ async def compose_from_state(request: Request):
             raise HTTPException(status_code=409, detail={"error": "platform_expired"})
 
         # Rate limiting logic
+        import os
         dev_mode = os.getenv("ENVIRONMENT") == "development" or os.getenv("FASTAPI_ENV") == "dev"
         threshold = 30 if dev_mode else 10
 
@@ -572,67 +385,53 @@ async def compose_from_state(request: Request):
         utc_day = now_utc.date().isoformat()
 
         
-        # Add log before idempotency check
-        log.error("cfs: BEFORE AWAIT check_idempotency chat_id=%s", chat_id)
         # Check idempotency first: interactions.request_id
         cached_interaction = db.get_interaction_by_request_id(request_id)
-        log.info(f"cache | idempotency hit={cached_interaction is not None} | chat_id={chat_id} | req_id={request_id}")
+        log.info(f"cache | idempotency hit={cached_interaction is not None} | chat_id={req.chat_id} | req_id={request_id}")
         if cached_interaction and cached_interaction.get("output_json"):
             # Return cached response without incrementing rate limit
             return ComposeResponse(**cached_interaction["output_json"])
         
-        # Add log before content cache check
-        log.error("cfs: BEFORE AWAIT check_content_cache chat_id=%s", chat_id)
         # Check content cache: (chat_id, text_hash, platform)
         try:
-            import hashlib
-            text_sha = hashlib.sha256(text.encode('utf-8')).hexdigest()
-            hit, payload = False, None
-            if CONTENT_CACHE_ENABLED:
-                row = db.get_cached_by_content(chat_id, text_sha, platform)
-                hit = bool(row)
-                payload = row["result_json"] if row else None
-            else:
-                hit, payload = False, None
-            log.info(f"cache | content hit={hit} | chat_id={chat_id} | platform={platform}")
-            if hit and payload:
+            cached = db.get_cached_request_by_content(req.chat_id, req.text, platform)
+            log.info(f"cache | content hit={cached is not None} | chat_id={req.chat_id} | platform={platform}")
+            if cached:
                 # Return cached response without incrementing rate limit
-                return ComposeResponse(**payload)
-            # If we have a row but no result_json, continue without cache
+                if cached["status"] == 200:
+                    return ComposeResponse(**cached["response"])
+                else:
+                    raise HTTPException(status_code=cached["status"], detail=cached["response"])
         except Exception as e:
             log.warning(f"Failed to check content cache: {e}")
             # Continue without content caching
-        log.error("cfs: AFTER AWAIT check_content_cache chat_id=%s", chat_id)
 
         # Check rate limit (without increment)
-        hits_before, allowed = db.check_rate_limit(chat_id, utc_day, threshold)
+        hits_before, allowed = db.check_rate_limit(req.chat_id, utc_day, threshold)
         decision = "ok" if allowed else "429"
-        log.info(f"rate | chat_id={chat_id} | utc_day={utc_day} | hits_before={hits_before} | threshold={threshold} | decision={decision} | now_utc={now_utc.isoformat()}")
+        log.info(f"rate | chat_id={req.chat_id} | utc_day={utc_day} | hits_before={hits_before} | threshold={threshold} | decision={decision} | now_utc={now_utc.isoformat()}")
 
         if not allowed:
             # Log the 429 response for idempotency
             try:
-                db.log_interaction(chat_id, platform, text, {"error": "limit_reached", "reset_at": "24 hours"}, request_id=request_id)
+                db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours"}, chat_id=req.chat_id, request_id=request_id)
             except Exception as e:
                 log.warning(f"log_interaction failed: {e}")
-
+            
             # Also cache the 429 response by content for consistency
-            if CONTENT_CACHE_ENABLED:
-                try:
-                    db.cache_request_by_content_error(chat_id, text_sha, platform, {"error": "limit_reached", "reset_at": "24 hours"}, ttl_seconds=300)
-                except Exception as e:
-                    log.warning(f"Failed to cache 429 response by content: {e}")
+            try:
+                db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "24 hours"}, 429)
+            except Exception as e:
+                log.warning(f"Failed to cache 429 response by content: {e}")
             
             reset_at = "soon" if dev_mode else "24 hours"
             raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": reset_at})
 
-        # Add log before calling compose_async
-        log.error("cfs: BEFORE AWAIT compose_async chat_id=%s", chat_id)
         # Call internal async compose function with retry logic for LLM rate limits
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                result = await compose_async(platform, text, str(chat_id), business_type=None, request_id=request_id)
+                result = await compose_async(platform, req.text, str(req.chat_id), business_type=None, request_id=request_id)
                 break
             except Exception as llm_error:
                 # Check if this is an LLM rate limit error (status code 429)
@@ -644,58 +443,51 @@ async def compose_from_state(request: Request):
                         continue
                     else:
                         # After all retries, return a 429 with appropriate message
-                        log.info(f"LLM rate limit reached after retries for chat_id {chat_id}")
+                        log.info(f"LLM rate limit reached after retries for chat_id {req.chat_id}")
                         # Log the LLM 429 response for idempotency
                         try:
-                            db.log_interaction(chat_id, platform, text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
+                            db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, chat_id=req.chat_id, request_id=request_id)
                         except Exception as e:
                             log.warning(f"log_interaction failed: {e}")
-
+                        
                         # Also cache the LLM 429 response by content for consistency
-                        if CONTENT_CACHE_ENABLED:
-                            try:
-                                db.cache_request_by_content_error(chat_id, text_sha, platform, {"error": "limit_reached", "reset_at": "soon"}, ttl_seconds=300)
-                            except Exception as e:
-                                log.warning(f"Failed to cache LLM 429 response by content: {e}")
+                        try:
+                            db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "soon"}, 429)
+                        except Exception as e:
+                            log.warning(f"Failed to cache LLM 429 response by content: {e}")
                         
                         raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": "soon"})
                 else:
                     # Re-raise if it's not an LLM rate limit error
                     raise llm_error
-        log.error("cfs: AFTER AWAIT compose_async chat_id=%s", chat_id)
 
         # Atomically increment rate limit after successful LLM call
-        increment_success = db.increment_rate_limit(chat_id, utc_day, threshold)
+        increment_success = db.increment_rate_limit(req.chat_id, utc_day, threshold)
         if not increment_success:
-            log.warning(f"Failed to increment rate limit for chat_id={chat_id}, utc_day={utc_day}")
+            log.warning(f"Failed to increment rate limit for chat_id={req.chat_id}, utc_day={utc_day}")
 
         # Log the interaction with request_id for idempotency
         try:
-            db.log_interaction(chat_id, platform, text, result, request_id=request_id)
+            db.log_interaction(str(req.chat_id), platform, req.text, result, chat_id=req.chat_id, request_id=request_id)
         except Exception as e:
             log.warning(f"log_interaction failed: {e}")
-
+        
         # Also cache by content for future requests with different request_id but same content
-        if CONTENT_CACHE_ENABLED:
-            try:
-                db.cache_request_by_content_new(chat_id, text_sha, platform, result, ttl_seconds=3600)
-            except Exception as e:
-                log.warning(f"Failed to cache request by content: {e}")
+        try:
+            db.cache_request_by_content(req.chat_id, req.text, platform, result, 200)
+        except Exception as e:
+            log.warning(f"Failed to cache request by content: {e}")
 
         # Log total response time
         total_time = time.time() - start_time
-        log.info(f"compose_from_state completed | chat_id={chat_id} | total_time={total_time:.2f}s")
+        log.info(f"compose_from_state completed | chat_id={req.chat_id} | total_time={total_time:.2f}s")
 
         return ComposeResponse(**result)
     except HTTPException:
         raise
     except Exception as e:
-        log.error("cfs: TOP-LEVEL FAIL")
-        log.exception("cfs: unhandled error")
-        if request.headers.get("x-cfs-diag") == "1":
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"error":"server_error","msg": str(e)}, status_code=500)
-        raise HTTPException(500, {"error":"server_error"})
+        log.exception("compose_from_state failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/webhook/n8n")
 async def n8n_webhook(request: Request):
@@ -735,39 +527,32 @@ async def n8n_webhook(request: Request):
 
         # Check content cache: (chat_id, text_hash, platform)
         try:
-            import hashlib
-            text_sha = hashlib.sha256(complaint_text.encode('utf-8')).hexdigest()
-            hit, payload = False, None
-            if CONTENT_CACHE_ENABLED:
-                row = db.get_cached_by_content(tg_user_id, text_sha, platform)
-                hit = bool(row)
-                payload = row["result_json"] if row else None
-            else:
-                hit, payload = False, None
-            log.info(f"n8n cache | content hit={hit} | chat_id={tg_user_id} | platform={platform}")
-            if hit and payload:
+            cached = db.get_cached_request_by_content(tg_user_id, complaint_text, platform)
+            log.info(f"n8n cache | content hit={cached is not None} | chat_id={tg_user_id} | platform={platform}")
+            if cached:
                 # Return cached response
-                return {"response": payload}
-            # If we have a row but no result_json, continue without cache
+                if cached["status"] == 200:
+                    return {"response": cached["response"]}
+                else:
+                    raise HTTPException(status_code=cached["status"], detail=cached["response"])
         except Exception as e:
             log.warning(f"Failed to check content cache: {e}")
             # Continue without content caching
 
         # Use data from payload directly
         result = await compose_async(platform, complaint_text, tg_user_id, business_type=business_type, request_id=request_id)
+        
         # Log the interaction with request_id for idempotency
         try:
-            db.log_interaction(tg_user_id, platform, complaint_text, result, request_id=request_id)
+            db.log_interaction(tg_user_id, platform, complaint_text, result, chat_id=tg_user_id, request_id=request_id)
         except Exception as e:
             log.warning(f"log_interaction failed: {e}")
-
         
         # Cache successful response by content
-        if CONTENT_CACHE_ENABLED:
-            try:
-                db.cache_request_by_content_new(tg_user_id, text_sha, platform, result, ttl_seconds=3600)
-            except Exception as e:
-                log.warning(f"Failed to cache request by content: {e}")
+        try:
+            db.cache_request_by_content(tg_user_id, complaint_text, platform, result, 200)
+        except Exception as e:
+            log.warning(f"Failed to cache request by content: {e}")
 
         log.info(f"Compose result: {result}")
 
@@ -777,9 +562,5 @@ async def n8n_webhook(request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        text_len = len(complaint_text) if 'complaint_text' in locals() else 0
-        text_sha = sha256(complaint_text.encode()).hexdigest()[:12] if 'complaint_text' in locals() else ""
-        platform_val = locals().get('platform', '')
-        chat_id_val = locals().get('tg_user_id', '')
-        log.exception(f"n8n webhook processing failed | text_len={text_len} | text_sha={text_sha} | platform={platform_val} | chat_id={chat_id_val}")
+        log.exception("n8n webhook processing failed")
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")

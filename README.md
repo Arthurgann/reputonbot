@@ -237,3 +237,10 @@ Use these endpoints to verify backend availability after deployment or when debu
   - `request_id = {{$json.headers['x-request-id']}}`
 
 Заголовки отдаются в нижнем регистре (`x-...`), смотри `Output → JSON → headers` у HTTP-ноды.
+
+**Schema version:** v0.1.1 (frozen)
+
+### 📜 Миграции
+- Текущая схема БД зафиксирована артефактом `sql/001_v0.1.1.sql`.
+- Скрипт не применяется автоматически и служит снимком состояния на момент релиза v0.1.1.
+- Изменения для будущих версий оформляются отдельными файлами `sql/00N_v0.1.X.sql`.

@@ -217,3 +217,23 @@ Use these endpoints to verify backend availability after deployment or when debu
 - **Content cache** (by `(chat_id, text_hash, platform)`) — optional; to be enabled in v0.1.2
 
 > Note: Rate-limit 429 may trigger during tests — use another `chat_id`, change text, or lift threshold temporarily.
+
+## Readiness & Timeouts
+
+- **Global timeout (middleware):** 30s hard-cap → долгие запросы получают **503** `{"error":"busy","message":"service timeout"}`
+- **LLM timeout:** 25s (без retry на 429)
+- **DB timing (v0.1.1):** мониторинг медленных запросов (warnings при `select > 2000ms`, `write > 3000ms`); суммарное время в заголовке `X-DB-ms`
+- **Per-request DB timeouts:** план на v0.1.2 (точечно на горячих функциях)
+- **/readyz:** 200 `{"ready":true}` при доступности БД и наличии `platform_rules`; иначе 503 `{"ready":false}`
+
+## n8n integration: headers & logging
+
+В HTTP-ноде, которая вызывает backend:
+- Включи **Options → Include Response Headers**.
+- После ноды добавь **Set** (или **Function Item**) и запиши:
+  - `elapsed_ms = {{$json.headers['x-elapsed-ms']}}`
+  - `db_ms      = {{$json.headers['x-db-ms']}}`
+  - `llm_ms     = {{$json.headers['x-llm-ms']}}`
+  - `request_id = {{$json.headers['x-request-id']}}`
+
+Заголовки отдаются в нижнем регистре (`x-...`), смотри `Output → JSON → headers` у HTTP-ноды.

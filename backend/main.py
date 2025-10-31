@@ -6,12 +6,14 @@ import asyncio
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
 from .models.schemas import ComposeRequest, ComposeResponse, StateSetRequest, ComposeFromStateRequest
 from . import services
 from .services import db, llm
 from .services.logger import log
 from .services.probability import score_probability
+from backend.services.db import get_client
 
 
 # Use uvloop for better async performance (only on non-Windows systems)
@@ -42,7 +44,10 @@ async def add_timing_headers(request: Request, call_next):
     request.state.llm_ms = 0.0
     t0 = perf_counter()
     
-    response = await call_next(request)
+    try:
+        response = await asyncio.wait_for(call_next(request), timeout=30.0)
+    except asyncio.TimeoutError:
+        return JSONResponse(status_code=503, content={"error": "busy", "message": "service timeout"})
     
     # Add timing headers to response
     response.headers["X-Request-ID"] = request.state.request_id
@@ -134,41 +139,20 @@ def healthz():
     return result
 
 @app.get("/readyz")
-def readyz():
-    import time
-    from .services.db import get_client
-    from .config import settings
-    
-    # Get app version from environment, default to 'dev'
-    version = settings.APP_VERSION if hasattr(settings, 'APP_VERSION') else os.getenv("APP_VERSION", "dev")
-    
-    # For now, readyz duplicates healthz
-    # Future: Add additional checks (e.g., cache readiness) here
-    uptime_s = time.time() - app.state.start_time
-    
-    # Test database connection
-    ready = True
+async def readyz():
+    """
+    Readiness probe: проверяет доступность БД и наличие хотя бы одной записи в platform_rules.
+    200 {"ready": true} если всё ок; иначе 503 {"ready": false}.
+    """
     try:
-        # Check if required environment variables are present
-        if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_ROLE_KEY:
-            ready = False
-        else:
-            sb = get_client()
-            # Light ping using select from a guaranteed existing table
-            sb.table("platform_rules").select('platform').limit(1).execute()
+        sb = get_client()
+        res = sb.table("platform_rules").select("platform").limit(1).execute()
+        if not res or not getattr(res, "data", None):
+            return JSONResponse(status_code=503, content={"ready": False})
+        return {"ready": True}
     except Exception as e:
-        ready = False
-    
-    result = {
-        "ready": ready,
-        "version": version
-    }
-    
-    if not ready:
-        from fastapi.responses import JSONResponse
-        return JSONResponse(content=result, status_code=503)
-    
-    return result
+        log.warning(f"/readyz failed: {e}")
+        return JSONResponse(status_code=503, content={"ready": False})
 
 async def compose_async(platform: str, text: str, chat_id: Optional[str] = None, business_type: Optional[str] = None, request_id: Optional[str] = None) -> dict:
     """

@@ -12,7 +12,7 @@ async def get_openai_client() -> httpx.AsyncClient:
     if _openai_client is None or _openai_client.is_closed:
         _openai_client = httpx.AsyncClient(
             http2=True,  # Enable HTTP/2
-            timeout=httpx.Timeout(10.0, connect=3.0, read=7.0),  # Optimized timeouts: connect 3s, read 7s
+            timeout=httpx.Timeout(25.0, connect=3.0, read=22.0),  # Optimized timeouts: connect 3s, read 22s
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=30.0),
             headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"}
         )

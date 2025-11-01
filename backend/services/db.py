@@ -1,5 +1,4 @@
 import time
-import time
 from typing import Optional, Any, Dict
 from supabase import create_client, Client
 from .. import services
@@ -11,6 +10,14 @@ import asyncio
 _client: Optional[Client] = None
 _platform_rules_cache: Optional[Dict[str, Dict[str, Any]]] = None
 _cache_lock = asyncio.Lock()
+
+class DbTimer:
+    def __init__(self, request): self.request=request
+    def __enter__(self): self.t0=time.perf_counter(); return self
+    def __exit__(self, *args):
+        if self.request:
+            self.request.state.db_ms = getattr(self.request.state,"db_ms",0.0)+(time.perf_counter()-self.t0)*1000.0
+
 
 def get_client() -> Client:
     global _client

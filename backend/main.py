@@ -17,6 +17,7 @@ from .services.probability import score_probability
 from .services.db import get_client
 
 CONTENT_CACHE_ENABLED = os.getenv("CONTENT_CACHE_ENABLED", "0") == "1"
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "25"))
 
 
 # Use uvloop for better async performance (only on non-Windows systems)
@@ -156,7 +157,7 @@ async def readyz():
         log.warning(f"/readyz failed: {e}")
         return JSONResponse(status_code=503, content={"ready": False})
 
-async def compose_async(platform: str, text: str, chat_id: Optional[str] = None, business_type: Optional[str] = None, request_id: Optional[str] = None) -> dict:
+async def compose_async(platform: str, text: str, chat_id: Optional[str] = None, business_type: Optional[str] = None, request_id: Optional[str] = None, request: Request = None) -> dict:
     """
     Internal async function to compose complaint response based on platform and text
     """
@@ -190,16 +191,21 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     probability_label = score_probability(text, rules)
 
     # Call LLM asynchronously with all required parameters
-    result = await llm.compose_text_async(
-        system_prompt,
-        text,
-        business_type,
-        platform,
-        rules,
-        instruction_template,
-        tips,
-        report_url
-    )
+    import asyncio, time
+    t_llm0 = time.perf_counter()
+    try:
+        result = await asyncio.wait_for(
+            llm.compose_text_async(
+                system_prompt, text, business_type, platform,
+                rules, instruction_template, tips, report_url
+            ),
+            timeout=LLM_TIMEOUT_S,
+        )
+    finally:
+        # always add elapsed to request.state.llm_ms
+        if request is not None:
+            spent_ms = (time.perf_counter() - t_llm0) * 1000.0
+            request.state.llm_ms = getattr(request.state, "llm_ms", 0.0) + spent_ms
 
     # Ensure probability_label is set if not provided by LLM
     if "probability_label" not in result or result["probability_label"] is None:
@@ -213,10 +219,14 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     result["instruction_template"] = instruction_template
 
     # Log the interaction (moved after LLM call for performance)
-    try:
-        await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
-    except Exception as e:
-        log.warning(f"log_interaction failed: {e}")
+    if request:
+        with db.DbTimer(request):
+            await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
+    else:
+        try:
+            await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
+        except Exception as e:
+            log.warning(f"log_interaction failed: {e}")
 
     return result
 
@@ -253,20 +263,16 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
                 log.warning(f"Failed to check content cache: {e}")
                 # Continue without content caching
         
-        result = await compose_async(req.platform, req.text, req.tg_user_id, req.business_type, request_id=request_id)
+        result = await compose_async(req.platform, req.text, req.tg_user_id, req.business_type, request_id=request_id, request=request)
         
         # Log the interaction with request_id for idempotency
-        try:
+        with db.DbTimer(request):
             await db.log_interaction(req.tg_user_id, req.platform, req.text, result, request_id=request_id)
-        except Exception as e:
-            log.warning(f"log_interaction failed: {e}")
         
         # Also cache by content for future requests with different request_id but same content
         if CONTENT_CACHE_ENABLED:
-            try:
+            with db.DbTimer(request):
                 db.cache_request_by_content(req.tg_user_id, req.text, req.platform, result, 200)
-            except Exception as e:
-                log.warning(f"Failed to cache request by content: {e}")
         
         return ComposeResponse(**result)
     except Exception as e:
@@ -359,7 +365,8 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         TTL = dt.timedelta(hours=24)
 
         # Get platform and updated_at from chat state using optimized query
-        row = await db.get_chat_state_with_updated_at(chat_id)
+        with db.DbTimer(request):
+            row = await db.get_chat_state_with_updated_at(chat_id)
 
         if not row or not row.get("platform"):
             log.info(f"compose check | chat_id={chat_id} | platform=None | chosen_at=None | now=None | zone=None | decision=no_platform")
@@ -421,7 +428,8 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                 # Continue without content caching
 
         # Check rate limit (without increment)
-        hits_before, allowed = db.check_rate_limit(req.chat_id, utc_day, threshold)
+        with db.DbTimer(request):
+            hits_before, allowed = db.check_rate_limit(req.chat_id, utc_day, threshold)
         decision = "ok" if allowed else "429"
         log.info(f"rate | chat_id={req.chat_id} | utc_day={utc_day} | hits_before={hits_before} | threshold={threshold} | decision={decision} | now_utc={now_utc.isoformat()}")
 
@@ -441,13 +449,28 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
             
             reset_at = "soon" if dev_mode else "24 hours"
             raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": reset_at})
-
         # Call internal async compose function with retry logic for LLM rate limits
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                result = await compose_async(platform, req.text, str(req.chat_id), business_type=None, request_id=request_id)
+                result = await compose_async(platform, req.text, str(req.chat_id), business_type=None, request_id=request_id, request=request)
                 break
+            except asyncio.TimeoutError:
+                # Catch asyncio.TimeoutError from compose_async and raise HTTPException(
+                # status_code=429,
+                # detail={"error": "limit_reached", "reset_at": "soon"}
+                # )
+                log.info(f"LLM timeout for chat_id {req.chat_id}")
+                # Log the timeout response for idempotency
+                with db.DbTimer(request):
+                    await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
+                
+                # Also cache the timeout response by content for consistency
+                if CONTENT_CACHE_ENABLED:
+                    with db.DbTimer(request):
+                        db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "soon"}, 429)
+                
+                raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": "soon"})
             except Exception as llm_error:
                 # Check if this is an LLM rate limit error (status code 429)
                 if hasattr(llm_error, 'status_code') and llm_error.status_code == 429:
@@ -460,17 +483,13 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                         # After all retries, return a 429 with appropriate message
                         log.info(f"LLM rate limit reached after retries for chat_id {req.chat_id}")
                         # Log the LLM 429 response for idempotency
-                        try:
+                        with db.DbTimer(request):
                             await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
-                        except Exception as e:
-                            log.warning(f"log_interaction failed: {e}")
                         
                         # Also cache the LLM 429 response by content for consistency
                         if CONTENT_CACHE_ENABLED:
-                            try:
+                            with db.DbTimer(request):
                                 db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "soon"}, 429)
-                            except Exception as e:
-                                log.warning(f"Failed to cache LLM 429 response by content: {e}")
                         
                         raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": "soon"})
                 else:
@@ -478,11 +497,8 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                     raise llm_error
 
         # Atomically increment rate limit after successful LLM call
-        try:
+        with db.DbTimer(request):
             increment_success = await db.increment_rate_limit(req.chat_id, utc_day, threshold)
-        except Exception as e:
-            log.warning(f"Failed to increment rate limit: {e}")
-            increment_success = False
 
         if not increment_success:
             log.warning(f"Failed to increment rate limit for chat_id={req.chat_id}, utc_day={utc_day}")
@@ -490,10 +506,8 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         
         # Also cache by content for future requests with different request_id but same content
         if CONTENT_CACHE_ENABLED:
-            try:
+            with db.DbTimer(request):
                 db.cache_request_by_content(req.chat_id, req.text, platform, result, 200)
-            except Exception as e:
-                log.warning(f"Failed to cache request by content: {e}")
 
         # Log total response time
         total_time = time.time() - start_time
@@ -558,20 +572,16 @@ async def n8n_webhook(request: Request):
                 # Continue without content caching
 
         # Use data from payload directly
-        result = await compose_async(platform, complaint_text, tg_user_id, business_type=business_type, request_id=request_id)
+        result = await compose_async(platform, complaint_text, tg_user_id, business_type=business_type, request_id=request_id, request=request)
         
         # Log the interaction with request_id for idempotency
-        try:
+        with db.DbTimer(request):
             await db.log_interaction(tg_user_id, platform, complaint_text, result, request_id=request_id)
-        except Exception as e:
-            log.warning(f"log_interaction failed: {e}")
         
         # Cache successful response by content
         if CONTENT_CACHE_ENABLED:
-            try:
+            with db.DbTimer(request):
                 db.cache_request_by_content(tg_user_id, complaint_text, platform, result, 200)
-            except Exception as e:
-                log.warning(f"Failed to cache request by content: {e}")
 
         log.info(f"Compose result: {result}")
 

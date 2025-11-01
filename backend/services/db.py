@@ -1,16 +1,16 @@
 import time
-import logging
+import time
 from typing import Optional, Any, Dict
 from supabase import create_client, Client
-from .logger import log
+from .. import services
+from ..services import logger as logger_mod
+log = logger_mod.log
 from ..config import settings
 import asyncio
 
 _client: Optional[Client] = None
 _platform_rules_cache: Optional[Dict[str, Dict[str, Any]]] = None
 _cache_lock = asyncio.Lock()
-
-log = logging.getLogger("reputonbot")
 
 def get_client() -> Client:
     global _client
@@ -241,38 +241,51 @@ def check_rate_limit(chat_id: int, utc_day: str, threshold: int = 10) -> tuple[i
     else:
         return 0, True
 
-async def increment_rate_limit(chat_id: int, utc_day: str, threshold: int) -> bool:
+async def increment_rate_limit(chat_id: int | str, utc_day: str, threshold: int) -> bool:
     """
-    Increment rate limit counter for chat_id on utc_day.
-    Returns True if increment was successful, False otherwise.
+    Инкремент rate_limits.hits с насыщением по threshold.
+    Возвращает True при успехе, False при неожиданной ошибке.
+    Никаких индексирований булевых/результатов — только факт успеха.
     """
-    sb = get_client()
-    t0 = time.perf_counter()
-    
     try:
-        # Call the Supabase RPC function to atomically increment the rate limit
-        res = await asyncio.wait_for(
-            asyncio.to_thread(lambda: sb.rpc("increment_rate_limit", {
-                "p_chat_id": chat_id,
-                "p_utc_day": utc_day,
-                "p_threshold": threshold
-            }).execute()),
-            timeout=2.0
-        )
-        
-        dt_ms = (time.perf_counter() - t0) * 1000
-        if dt_ms > 2000:
-            log.warning("DB slow: increment_rate_limit took %.1f ms", dt_ms)
-            
-        # The RPC function returns a boolean indicating if the increment was allowed
-        if res and res.data:
-            return res.data[0].get("increment_rate_limit", True)
-        return True
-    except asyncio.TimeoutError:
-        log.warning("increment_rate_limit: Supabase RPC call timed out")
-        return False
+        sb = get_client()
+
+        # 1) Пробуем прочитать текущую строку
+        sel = sb.table("rate_limits")\
+                .select("hits,threshold")\
+                .eq("chat_id", str(chat_id))\
+                .eq("utc_day", utc_day)\
+                .limit(1)\
+                .execute()
+
+        if getattr(sel, "data", None) and len(sel.data) == 1:
+            row = sel.data[0]
+            current_hits = int(row.get("hits", 0))
+            row_threshold = int(row.get("threshold", threshold))
+            new_hits = current_hits + 1
+            if new_hits > row_threshold:
+                new_hits = row_threshold
+
+            # 2) Обновляем
+            sb.table("rate_limits")\
+              .update({"hits": new_hits, "threshold": row_threshold})\
+              .eq("chat_id", str(chat_id))\
+              .eq("utc_day", utc_day)\
+              .execute()
+            return True
+        else:
+            # 3) Вставляем новую запись (первая попытка за день)
+            payload = {
+                "chat_id": str(chat_id),
+                "utc_day": utc_day,
+                "hits": 1,
+                "threshold": int(threshold),
+            }
+            sb.table("rate_limits").insert(payload).execute()
+            return True
+
     except Exception as e:
-        log.warning(f"increment_rate_limit failed: {e}")
+        log.warning(f"increment_rate_limit unexpected error: {e}")
         return False
 
 def get_interaction_by_request_id(request_id: str) -> Optional[Dict[str, Any]]:
@@ -340,29 +353,6 @@ def cache_request_by_content(chat_id: int, text: str, platform: str, response: D
     except Exception as e:
         log.warning(f"Failed to cache request by content: {e}")
 
-def cache_request_by_content(chat_id: int, text: str, platform: str, response: Dict[str, Any], status: int) -> None:
-    """
-    Cache response by content (chat_id, text, platform) for caching repeated requests.
-    """
-    import hashlib
-    sb = get_client()
-    # Create hash of the text for comparison
-    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()
-    
-    t0 = time.perf_counter()
-    try:
-        sb.table("request_cache").upsert({
-            "chat_id": chat_id,
-            "text_hash": text_hash,
-            "platform": platform,
-            "response": response,
-            "status": status
-        }).execute()
-        dt_ms = (time.perf_counter() - t0) * 1000
-        if dt_ms > 3000:
-            log.warning("DB slow: cache_request_by_content took %.1f ms", dt_ms)
-    except Exception as e:
-        log.warning(f"Failed to cache request by content: {e}")
 
 def check_and_increment_rate_limit(chat_id: int, threshold: int = 10) -> bool:
     """

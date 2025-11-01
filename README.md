@@ -237,3 +237,97 @@ Use these endpoints to verify backend availability after deployment or when debu
   - `request_id = {{$json.headers['x-request-id']}}`
 
 Заголовки отдаются в нижнем регистре (`x-...`), смотри `Output → JSON → headers` у HTTP-ноды.
+
+## Environment
+
+Required:
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `OPENAI_API_KEY`
+
+Recommended:
+- `APP_ENV` = `dev` | `prod`
+- `LOG_LEVEL` = `INFO` (default) | `DEBUG` | `WARNING` | `ERROR`
+- `APP_VERSION` = semver, например `0.1.1`
+- `LLM_TIMEOUT_S` = `25` (жёсткий таймаут LLM)
+- `CONTENT_CACHE_ENABLED` = `0|1` (кэш одинаковых запросов по содержанию)
+- `OPENAI_CLIENT_REUSE_ENABLED` = `0|1` (reuse httpx AsyncClient, keep-alive/HTTP2)
+
+Notes:
+- В `dev` удобнее ослаблять rate limit, но мы используем один и тот же код; порог регулируется в БД.
+
+## Idempotency
+
+Клиент должен передавать `X-Request-ID` (UUID). Бэкенд:
+- при повторном запросе с тем же `X-Request-ID` возвращает **бит-в-бит** тот же JSON без повторных вызовов LLM/БД;
+- `interactions.request_id` хранит связь для идемпотентности.
+
+Проверка (пример):
+```powershell
+$req=[guid]::NewGuid().ToString()
+$body=@{ chat_id=123; text="test" } | ConvertTo-Json
+iwr http://127.0.0.1:8010/compose_from_state -Method POST -Headers @{ "X-Request-ID"=$req } -ContentType application/json -Body $body | % Content > a.json
+iwr http://127.0.0.1:8010/compose_from_state -Method POST -Headers @{ "X-Request-ID"=$req } -ContentType application/json -Body $body | % Content > b.json
+fc.exe a.json b.json # различий быть не должно
+
+
+---
+
+# 3) Заголовки таймингов (диагностика)
+
+Отдельный подзаголовок, чтобы команда и “будущий ты” быстро находили:
+
+```md
+## Timing headers
+
+Каждый ответ содержит:
+- `X-Request-ID` — отражает входной (или сгенерированный) request id
+- `X-Elapsed-ms` — общее время запроса
+- `X-DB-ms` — суммарное время операций БД
+- `X-LLM-ms` — суммарное время LLM
+
+В `429/409` заголовки тоже возвращаются (обычно `X-LLM-ms=0.0`).
+
+## Error contracts
+
+- **400** `{"error":"invalid_input","field":"platform|text"[,"reason":"empty|too_long","limit":6000]}`
+- **409** `{"error":"no_platform"}` или `{"error":"platform_expired"}`
+- **429** `{"error":"limit_reached","reset_at":"24 hours|soon"}`  
+  (в том числе, если сработал LLM timeout `LLM_TIMEOUT_S`)
+- **503** `{"error":"busy","message":"service timeout"}` — глобальный таймаут middleware (30s)
+
+Все ответы содержат диагностические заголовки (см. Timing headers).
+
+## Health & Readiness
+
+- **GET `/healthz`** — пульс + пинг БД (без прогрева кэша).
+- **GET `/readyz`** — сервис готов, если:
+  1) БД отвечает, **и**
+  2) кэш правил платформ прогрет (запрос `get_platform_rules_cached("ozon")` не падает).
+
+На старте `/readyz` может на доли секунды вернуть 503, затем 200.
+
+## Smoke tests
+
+Полные команды в `docs/SMOKE.md`. Кратко:
+1) `/healthz` → 200
+2) `/state/set` → 200
+3) `/compose_from_state` → 200 (первый вызов), 200 (идемпотентный повтор)
+4) При превышении дневного лимита → 429 c заголовками таймингов
+
+## Performance flags
+
+- `OPENAI_CLIENT_REUSE_ENABLED=1` — переиспользование HTTP-клиента (keep-alive/HTTP2), экономит ~0.3–0.6s на «холодных» запросах.
+- `CONTENT_CACHE_ENABLED=1` — кэширование одинакового `(chat_id, text_hash, platform)`, снижает нагрузку и латентность на повторах.
+
+## Database schema & migrations
+
+Актуальная схема: **v0.1.1**. Миграции хранятся в `sql/001_v0.1.1.sql`.  
+Краткая инструкция применения — в `sql/README.md`.
+
+Ключевые индексы:
+- `interactions_request_id_uq_partial` (partial unique) — идемпотентность.
+- `request_cache (chat_id, text_hash, platform)` — быстрый поиск дублей.
+- `chat_state_updated_at_idx` — TTL-проверки выбора платформы.
+- `rate_limits: chat_id_idx` — быстрый счётчик на пользователя/день.
+

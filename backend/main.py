@@ -235,7 +235,7 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
         cached_interaction = db.get_interaction_by_request_id(request_id)
         log.info(f"compose cache | idempotency hit={cached_interaction is not None} | chat_id={req.tg_user_id} | req_id={request_id}")
         if cached_interaction and cached_interaction.get("output_json"):
-            # Return cached response
+            # Return cached response immediately without re-logging or rate-limit increment
             return ComposeResponse(**cached_interaction["output_json"])
         
         # Check content cache: (chat_id, text_hash, platform)
@@ -402,7 +402,7 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         cached_interaction = db.get_interaction_by_request_id(request_id)
         log.info(f"cache | idempotency hit={cached_interaction is not None} | chat_id={req.chat_id} | req_id={request_id}")
         if cached_interaction and cached_interaction.get("output_json"):
-            # Return cached response without incrementing rate limit
+            # Return cached response immediately without re-logging or rate-limit increment
             return ComposeResponse(**cached_interaction["output_json"])
         
         # Check content cache: (chat_id, text_hash, platform)

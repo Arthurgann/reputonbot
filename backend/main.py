@@ -152,6 +152,10 @@ async def readyz():
         res = sb.table("platform_rules").select("platform").limit(1).execute()
         if not res or not getattr(res, "data", None):
             return JSONResponse(status_code=503, content={"ready": False})
+        
+        # Verify platform-rules cache is warm
+        _ = db.get_platform_rules_cached("ozon")
+        
         return {"ready": True}
     except Exception as e:
         log.warning(f"/readyz failed: {e}")

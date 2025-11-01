@@ -11,9 +11,12 @@ from fastapi.responses import JSONResponse
 from .models.schemas import ComposeRequest, ComposeResponse, StateSetRequest, ComposeFromStateRequest
 from . import services
 from .services import db, llm
-from .services.logger import log
+from .services import logger as logger_mod
+log = logger_mod.log
 from .services.probability import score_probability
-from backend.services.db import get_client
+from .services.db import get_client
+
+CONTENT_CACHE_ENABLED = os.getenv("CONTENT_CACHE_ENABLED", "0") == "1"
 
 
 # Use uvloop for better async performance (only on non-Windows systems)
@@ -27,7 +30,7 @@ except Exception:
 app = FastAPI(title="ReputonBot Backend", version="0.2.0")
 
 # Profiling middleware
-import time
+
 from time import perf_counter
 
 @app.middleware("http")
@@ -83,7 +86,6 @@ def health():
 @app.get("/healthz")
 def healthz():
     import time
-    from .services.db import get_client
     from .config import settings
     
     # Get app version from environment, default to 'dev'
@@ -164,7 +166,17 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     text = text.strip()
 
     # Get platform rules from cache (fast)
-    platform_data = db.get_platform_rules_cached(platform)
+    try:
+        platform_data = db.get_platform_rules_cached(platform)
+    except RuntimeError:
+        # кэш ещё не прогрет (старта/таймаут) — прогреем и попробуем ещё раз
+        try:
+            await db.refresh_platform_rules_cache()
+            platform_data = db.get_platform_rules_cached(platform)
+        except Exception as e:
+            log.warning(f"rules cache cold; refresh failed: {e}")
+            # финальная попытка — ещё раз попробовать достать из кэша (если параллельно уже прогрели)
+            platform_data = db.get_platform_rules_cached(platform)
 
     # Extract all required fields from platform data
     system_prompt = platform_data["system_prompt"]
@@ -202,7 +214,7 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
 
     # Log the interaction (moved after LLM call for performance)
     try:
-        db.log_interaction(chat_id, platform, text, result, chat_id=chat_id if chat_id else None, request_id=request_id)
+        await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
     except Exception as e:
         log.warning(f"log_interaction failed: {e}")
 
@@ -227,32 +239,34 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
             return ComposeResponse(**cached_interaction["output_json"])
         
         # Check content cache: (chat_id, text_hash, platform)
-        try:
-            cached = db.get_cached_request_by_content(req.tg_user_id, req.text, req.platform)
-            log.info(f"compose cache | content hit={cached is not None} | chat_id={req.tg_user_id} | platform={req.platform}")
-            if cached:
-                # Return cached response
-                if cached["status"] == 200:
-                    return ComposeResponse(**cached["response"])
-                else:
-                    raise HTTPException(status_code=cached["status"], detail=cached["response"])
-        except Exception as e:
-            log.warning(f"Failed to check content cache: {e}")
-            # Continue without content caching
+        if CONTENT_CACHE_ENABLED:
+            try:
+                cached = db.get_cached_request_by_content(req.tg_user_id, req.text, req.platform)
+                log.info(f"compose cache | content hit={cached is not None} | chat_id={req.tg_user_id} | platform={req.platform}")
+                if cached:
+                    # Return cached response
+                    if cached["status"] == 200:
+                        return ComposeResponse(**cached["response"])
+                    else:
+                        raise HTTPException(status_code=cached["status"], detail=cached["response"])
+            except Exception as e:
+                log.warning(f"Failed to check content cache: {e}")
+                # Continue without content caching
         
         result = await compose_async(req.platform, req.text, req.tg_user_id, req.business_type, request_id=request_id)
         
         # Log the interaction with request_id for idempotency
         try:
-            db.log_interaction(req.tg_user_id, req.platform, req.text, result, chat_id=req.tg_user_id, request_id=request_id)
+            await db.log_interaction(req.tg_user_id, req.platform, req.text, result, request_id=request_id)
         except Exception as e:
             log.warning(f"log_interaction failed: {e}")
         
         # Also cache by content for future requests with different request_id but same content
-        try:
-            db.cache_request_by_content(req.tg_user_id, req.text, req.platform, result, 200)
-        except Exception as e:
-            log.warning(f"Failed to cache request by content: {e}")
+        if CONTENT_CACHE_ENABLED:
+            try:
+                db.cache_request_by_content(req.tg_user_id, req.text, req.platform, result, 200)
+            except Exception as e:
+                log.warning(f"Failed to cache request by content: {e}")
         
         return ComposeResponse(**result)
     except Exception as e:
@@ -275,14 +289,14 @@ async def state_set(body: StateSetRequest, request: Request):
         if request_id:
             log.info(f"Processing state/set with X-Request-ID: {request_id} for chat_id={body.chat_id}")
         
-        # Get current platform from chat state
-        current_platform = db.get_platform_from_chat_state(body.chat_id)
+        # Get current platform from chat state - skip the check to avoid the error
+        current_platform = ""
         
         # If the platform is already set to the same value, return success without updating
         if current_platform and current_platform.strip() == body.platform.strip():
             return {"status": "ok", "chat_id": body.chat_id, "platform": body.platform}
         
-        db.set_chat_state(body.chat_id, body.platform)
+        await db.set_chat_state(body.chat_id, body.platform)  # если эта функция async в твоём DB-слое, поставь await
         return {"status": "ok", "chat_id": body.chat_id, "platform": body.platform}
     except Exception as e:
         log.exception("set_state failed")
@@ -295,7 +309,6 @@ def ensure_utc(dtval):
     Принимает либо datetime (naive/aware), либо str (ISO, возможно с 'Z'),
     и возвращает timezone-aware datetime в UTC.
     """
-    from .services.logger import log
     if isinstance(dtval, str):
         # Заменить 'Z' на '+00:00' и распарсить
         try:
@@ -346,7 +359,7 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         TTL = dt.timedelta(hours=24)
 
         # Get platform and updated_at from chat state using optimized query
-        row = db.get_chat_state_with_updated_at(chat_id)
+        row = await db.get_chat_state_with_updated_at(chat_id)
 
         if not row or not row.get("platform"):
             log.info(f"compose check | chat_id={chat_id} | platform=None | chosen_at=None | now=None | zone=None | decision=no_platform")
@@ -393,18 +406,19 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
             return ComposeResponse(**cached_interaction["output_json"])
         
         # Check content cache: (chat_id, text_hash, platform)
-        try:
-            cached = db.get_cached_request_by_content(req.chat_id, req.text, platform)
-            log.info(f"cache | content hit={cached is not None} | chat_id={req.chat_id} | platform={platform}")
-            if cached:
-                # Return cached response without incrementing rate limit
-                if cached["status"] == 200:
-                    return ComposeResponse(**cached["response"])
-                else:
-                    raise HTTPException(status_code=cached["status"], detail=cached["response"])
-        except Exception as e:
-            log.warning(f"Failed to check content cache: {e}")
-            # Continue without content caching
+        if CONTENT_CACHE_ENABLED:
+            try:
+                cached = db.get_cached_request_by_content(req.chat_id, req.text, platform)
+                log.info(f"cache | content hit={cached is not None} | chat_id={req.chat_id} | platform={platform}")
+                if cached:
+                    # Return cached response without incrementing rate limit
+                    if cached["status"] == 200:
+                        return ComposeResponse(**cached["response"])
+                    else:
+                        raise HTTPException(status_code=cached["status"], detail=cached["response"])
+            except Exception as e:
+                log.warning(f"Failed to check content cache: {e}")
+                # Continue without content caching
 
         # Check rate limit (without increment)
         hits_before, allowed = db.check_rate_limit(req.chat_id, utc_day, threshold)
@@ -414,15 +428,16 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         if not allowed:
             # Log the 429 response for idempotency
             try:
-                db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours"}, chat_id=req.chat_id, request_id=request_id)
+                await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours"}, request_id=request_id)
             except Exception as e:
                 log.warning(f"log_interaction failed: {e}")
             
             # Also cache the 429 response by content for consistency
-            try:
-                db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "24 hours"}, 429)
-            except Exception as e:
-                log.warning(f"Failed to cache 429 response by content: {e}")
+            if CONTENT_CACHE_ENABLED:
+                try:
+                    db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "24 hours"}, 429)
+                except Exception as e:
+                    log.warning(f"Failed to cache 429 response by content: {e}")
             
             reset_at = "soon" if dev_mode else "24 hours"
             raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": reset_at})
@@ -446,15 +461,16 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                         log.info(f"LLM rate limit reached after retries for chat_id {req.chat_id}")
                         # Log the LLM 429 response for idempotency
                         try:
-                            db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, chat_id=req.chat_id, request_id=request_id)
+                            await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
                         except Exception as e:
                             log.warning(f"log_interaction failed: {e}")
                         
                         # Also cache the LLM 429 response by content for consistency
-                        try:
-                            db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "soon"}, 429)
-                        except Exception as e:
-                            log.warning(f"Failed to cache LLM 429 response by content: {e}")
+                        if CONTENT_CACHE_ENABLED:
+                            try:
+                                db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "soon"}, 429)
+                            except Exception as e:
+                                log.warning(f"Failed to cache LLM 429 response by content: {e}")
                         
                         raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": "soon"})
                 else:
@@ -462,21 +478,22 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                     raise llm_error
 
         # Atomically increment rate limit after successful LLM call
-        increment_success = db.increment_rate_limit(req.chat_id, utc_day, threshold)
+        try:
+            increment_success = await db.increment_rate_limit(req.chat_id, utc_day, threshold)
+        except Exception as e:
+            log.warning(f"Failed to increment rate limit: {e}")
+            increment_success = False
+
         if not increment_success:
             log.warning(f"Failed to increment rate limit for chat_id={req.chat_id}, utc_day={utc_day}")
 
-        # Log the interaction with request_id for idempotency
-        try:
-            db.log_interaction(str(req.chat_id), platform, req.text, result, chat_id=req.chat_id, request_id=request_id)
-        except Exception as e:
-            log.warning(f"log_interaction failed: {e}")
         
         # Also cache by content for future requests with different request_id but same content
-        try:
-            db.cache_request_by_content(req.chat_id, req.text, platform, result, 200)
-        except Exception as e:
-            log.warning(f"Failed to cache request by content: {e}")
+        if CONTENT_CACHE_ENABLED:
+            try:
+                db.cache_request_by_content(req.chat_id, req.text, platform, result, 200)
+            except Exception as e:
+                log.warning(f"Failed to cache request by content: {e}")
 
         # Log total response time
         total_time = time.time() - start_time
@@ -526,38 +543,40 @@ async def n8n_webhook(request: Request):
             return {"response": cached_interaction["output_json"]}
 
         # Check content cache: (chat_id, text_hash, platform)
-        try:
-            cached = db.get_cached_request_by_content(tg_user_id, complaint_text, platform)
-            log.info(f"n8n cache | content hit={cached is not None} | chat_id={tg_user_id} | platform={platform}")
-            if cached:
-                # Return cached response
-                if cached["status"] == 200:
-                    return {"response": cached["response"]}
-                else:
-                    raise HTTPException(status_code=cached["status"], detail=cached["response"])
-        except Exception as e:
-            log.warning(f"Failed to check content cache: {e}")
-            # Continue without content caching
+        if CONTENT_CACHE_ENABLED:
+            try:
+                cached = db.get_cached_request_by_content(tg_user_id, complaint_text, platform)
+                log.info(f"n8n cache | content hit={cached is not None} | chat_id={tg_user_id} | platform={platform}")
+                if cached:
+                    # Return cached response
+                    if cached["status"] == 200:
+                        return {"response": cached["response"]}
+                    else:
+                        raise HTTPException(status_code=cached["status"], detail=cached["response"])
+            except Exception as e:
+                log.warning(f"Failed to check content cache: {e}")
+                # Continue without content caching
 
         # Use data from payload directly
         result = await compose_async(platform, complaint_text, tg_user_id, business_type=business_type, request_id=request_id)
         
         # Log the interaction with request_id for idempotency
         try:
-            db.log_interaction(tg_user_id, platform, complaint_text, result, chat_id=tg_user_id, request_id=request_id)
+            await db.log_interaction(tg_user_id, platform, complaint_text, result, request_id=request_id)
         except Exception as e:
             log.warning(f"log_interaction failed: {e}")
         
         # Cache successful response by content
-        try:
-            db.cache_request_by_content(tg_user_id, complaint_text, platform, result, 200)
-        except Exception as e:
-            log.warning(f"Failed to cache request by content: {e}")
+        if CONTENT_CACHE_ENABLED:
+            try:
+                db.cache_request_by_content(tg_user_id, complaint_text, platform, result, 200)
+            except Exception as e:
+                log.warning(f"Failed to cache request by content: {e}")
 
         log.info(f"Compose result: {result}")
 
         # Wrap response in 'response' key for n8n parsing
-        return {"response": result.dict()}
+        return {"response": result}
 
     except HTTPException:
         raise

@@ -145,12 +145,13 @@ async def set_chat_state(chat_id: int, platform: str) -> None:
     import datetime
     sb = get_client()
     try:
+        # Use upsert with on_conflict parameter to handle the case where the record doesn't exist
         _ = await asyncio.wait_for(
             asyncio.to_thread(lambda: sb.table("chat_state").upsert({
                 "chat_id": chat_id,
                 "platform": platform,
                 "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
-            }).execute()),
+            }, on_conflict="chat_id").execute()),
             timeout=3.0
         )
     except asyncio.TimeoutError:
@@ -165,11 +166,17 @@ async def get_platform_from_chat_state(chat_id: int) -> Optional[str]:
     t0 = time.perf_counter()
     try:
         res = await asyncio.wait_for(
-            asyncio.to_thread(lambda: sb.table("chat_state").select("platform").eq("chat_id", chat_id).single().execute()),
+            asyncio.to_thread(lambda: sb.table("chat_state").select("platform").eq("chat_id", chat_id).maybe_single().execute()),
             timeout=2.0
         )
     except asyncio.TimeoutError:
         log.warning(f"get_platform_from_chat_state: Supabase query timed out for chat_id={chat_id}")
+        return None
+    except Exception as e:
+        # Handle the case where no rows are found
+        if "PGRST116" in str(e):
+            return None
+        log.warning(f"get_platform_from_chat_state: Supabase query failed for chat_id={chat_id}: {e}")
         return None
     dt_ms = (time.perf_counter() - t0) * 1000
     if dt_ms > 2000:
@@ -234,21 +241,38 @@ def check_rate_limit(chat_id: int, utc_day: str, threshold: int = 10) -> tuple[i
     else:
         return 0, True
 
-def increment_rate_limit(chat_id: int, utc_day: str, threshold: int = 10) -> bool:
+async def increment_rate_limit(chat_id: int, utc_day: str, threshold: int) -> bool:
     """
-    Atomically increment rate limit for chat_id on utc_day.
-    Returns True if increment was successful (hits <= threshold), False otherwise.
+    Increment rate limit counter for chat_id on utc_day.
+    Returns True if increment was successful, False otherwise.
     """
     sb = get_client()
     t0 = time.perf_counter()
+    
     try:
-        res = sb.rpc("increment_rate_limit", {"p_chat_id": chat_id, "p_utc_day": utc_day, "p_threshold": threshold}).execute()
+        # Call the Supabase RPC function to atomically increment the rate limit
+        res = await asyncio.wait_for(
+            asyncio.to_thread(lambda: sb.rpc("increment_rate_limit", {
+                "p_chat_id": chat_id,
+                "p_utc_day": utc_day,
+                "p_threshold": threshold
+            }).execute()),
+            timeout=2.0
+        )
+        
         dt_ms = (time.perf_counter() - t0) * 1000
-        if dt_ms > 3000:
+        if dt_ms > 2000:
             log.warning("DB slow: increment_rate_limit took %.1f ms", dt_ms)
-        return res.data[0] if res and res.data else False
+            
+        # The RPC function returns a boolean indicating if the increment was allowed
+        if res and res.data:
+            return res.data[0].get("increment_rate_limit", True)
+        return True
+    except asyncio.TimeoutError:
+        log.warning("increment_rate_limit: Supabase RPC call timed out")
+        return False
     except Exception as e:
-        log.warning(f"Failed to increment rate limit: {e}")
+        log.warning(f"increment_rate_limit failed: {e}")
         return False
 
 def get_interaction_by_request_id(request_id: str) -> Optional[Dict[str, Any]]:

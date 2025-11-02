@@ -1,34 +1,34 @@
-import os
-import platform
-import re
-import time
-import asyncio
-from typing import Dict, Any, Optional
-
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
-
-from .models.schemas import ComposeRequest, ComposeResponse, StateSetRequest, ComposeFromStateRequest
-from . import services
-from .services import db, llm
-from .services import logger as logger_mod
-log = logger_mod.log
-from .services.probability import score_probability
-from .services.db import get_client
-
-CONTENT_CACHE_ENABLED = os.getenv("CONTENT_CACHE_ENABLED", "0") == "1"
-LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "25"))
-
-
-# Use uvloop for better async performance (only on non-Windows systems)
 try:
-    if platform.system() != "Windows":
-        import uvloop  # type: ignore
-        uvloop.install()
+    from dotenv import load_dotenv
+    load_dotenv()  # если пакета нет — блок безопасно пропускается
 except Exception:
     pass
 
-app = FastAPI(title="ReputonBot Backend", version="0.2.0")
+from backend.utils.logger import configure_json_logging
+configure_json_logging()
+
+import os
+from backend.observability_lite import log_event
+
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import JSONResponse
+
+app = FastAPI(title="ReputonBot Backend", version=os.getenv("APP_VERSION", "0.1.0"))
+
+@app.on_event("startup")
+async def _obs_startup():
+    # покажет, что форматтер JSON активен и .env прочитан
+    log_event("debug_startup", log_json=os.getenv("LOG_JSON"))
+
+# Store start time for uptime calculation
+@app.on_event("startup")
+async def startup_event():
+    """Preload platform rules on startup"""
+    import time
+    app.state.start_time = time.time()
+    await db.preload_platform_rules()
+    # Start background task to refresh cache every 5 minutes
+    asyncio.create_task(refresh_cache_periodically())
 
 # Profiling middleware
 
@@ -46,12 +46,31 @@ async def add_timing_headers(request: Request, call_next):
     # Initialize timing values
     request.state.db_ms = 0.0
     request.state.llm_ms = 0.0
+    request.state.start_time = perf_counter()
+    
+    # Log the start of request processing
+    log_event("compose_start", request_id=request.state.request_id,
+              chat_id=getattr(request.state, "chat_id", None),
+              platform=getattr(request.state, "platform", None),
+              app_version=os.getenv("APP_VERSION", "unknown"))
+    
     t0 = perf_counter()
     
     try:
         response = await asyncio.wait_for(call_next(request), timeout=30.0)
     except asyncio.TimeoutError:
+        elapsed_ms, db_ms, llm_ms = get_ms(request)
+        log_event("compose_done", request_id=request.state.request_id,
+                  status=503, elapsed_ms=elapsed_ms, db_ms=db_ms, llm_ms=llm_ms)
         return JSONResponse(status_code=503, content={"error": "busy", "message": "service timeout"})
+    
+    # Get timing measurements for logging
+    elapsed_ms, db_ms, llm_ms = get_ms(request)
+    
+    # Log the completion of request processing
+    log_event("compose_done", request_id=request.state.request_id,
+              status=response.status_code,
+              elapsed_ms=elapsed_ms, db_ms=db_ms, llm_ms=llm_ms)
     
     # Add timing headers to response
     response.headers["X-Request-ID"] = request.state.request_id
@@ -61,15 +80,32 @@ async def add_timing_headers(request: Request, call_next):
     
     return response
 
-# Store start time for uptime calculation
-@app.on_event("startup")
-async def startup_event():
-    """Preload platform rules on startup"""
-    import time
-    app.state.start_time = time.time()
-    await db.preload_platform_rules()
-    # Start background task to refresh cache every 5 minutes
-    asyncio.create_task(refresh_cache_periodically())
+import platform
+import re
+import time
+import asyncio
+from typing import Dict, Any, Optional
+
+from .models.schemas import ComposeRequest, ComposeResponse, StateSetRequest, ComposeFromStateRequest
+from . import services
+from .services import db, llm
+from .services import logger as logger_mod
+log = logger_mod.log
+from .services.probability import score_probability
+from .services.db import get_client
+from .observability_lite import log_event, get_ms, add_db_ms, add_llm_ms
+
+CONTENT_CACHE_ENABLED = os.getenv("CONTENT_CACHE_ENABLED", "0") == "1"
+LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "25"))
+
+
+# Use uvloop for better async performance (only on non-Windows systems)
+try:
+    if platform.system() != "Windows":
+        import uvloop  # type: ignore
+        uvloop.install()
+except Exception:
+    pass
 
 async def refresh_cache_periodically():
     """Refresh platform rules cache every 5 minutes"""
@@ -136,7 +172,6 @@ def healthz():
         result["reason"] = reason
     
     if http_status == 503:
-        from fastapi.responses import JSONResponse
         return JSONResponse(content=result, status_code=http_status)
     
     return result
@@ -209,7 +244,7 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
         # always add elapsed to request.state.llm_ms
         if request is not None:
             spent_ms = (time.perf_counter() - t_llm0) * 1000.0
-            request.state.llm_ms = getattr(request.state, "llm_ms", 0.0) + spent_ms
+            add_llm_ms(request, spent_ms)
 
     # Ensure probability_label is set if not provided by LLM
     if "probability_label" not in result or result["probability_label"] is None:
@@ -225,7 +260,11 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     # Log the interaction (moved after LLM call for performance)
     if request:
         with db.DbTimer(request):
+            # Adding DB timing measurement
+            db_start = time.perf_counter()
             await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
+            db_elapsed = (time.perf_counter() - db_start) * 1000.0
+            add_db_ms(request, db_elapsed)
     else:
         try:
             await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
@@ -271,7 +310,11 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
         
         # Log the interaction with request_id for idempotency
         with db.DbTimer(request):
+            # Adding DB timing measurement
+            db_start = time.perf_counter()
             await db.log_interaction(req.tg_user_id, req.platform, req.text, result, request_id=request_id)
+            db_elapsed = (time.perf_counter() - db_start) * 1000.0
+            add_db_ms(request, db_elapsed)
         
         # Also cache by content for future requests with different request_id but same content
         if CONTENT_CACHE_ENABLED:
@@ -286,7 +329,6 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
 @app.post("/state/set")
 async def state_set(body: StateSetRequest, request: Request):
     if not body.platform.strip():
-        from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=400,
             content={"error": "invalid_input", "field": "platform"},
@@ -320,7 +362,7 @@ def ensure_utc(dtval):
     и возвращает timezone-aware datetime в UTC.
     """
     if isinstance(dtval, str):
-        # Заменить 'Z' на '+00:00' и распарсить
+        # Заменить 'Z' на '+0:00' и распарсить
         try:
             dtval = dtval.replace('Z', '+00:00')
             dtval = dt.datetime.fromisoformat(dtval)
@@ -359,10 +401,16 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
 
         # Validate text input
         if text is None or text.strip() == "":
+            # Log invalid input event
+            request_id = getattr(request.state, 'request_id', 'unknown')
+            log_event("invalid_input", request_id=request_id, chat_id=chat_id, status=400, text_len=len(text) if text else 0, platform=platform if 'platform' in locals() else None)
             raise HTTPException(400, detail={"error": "invalid_input", "field": "text", "reason": "empty"})
         
         MAX_TEXT_LEN = 6000
         if len(text) > MAX_TEXT_LEN:
+            # Log invalid input event
+            request_id = getattr(request.state, 'request_id', 'unknown')
+            log_event("invalid_input", request_id=request_id, chat_id=chat_id, status=400, text_len=len(text), platform=platform if 'platform' in locals() else None)
             raise HTTPException(400, detail={"error": "invalid_input", "field": "text", "reason": "too_long", "limit": 6000})
 
         # TTL check for platform selection
@@ -438,6 +486,11 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         log.info(f"rate | chat_id={req.chat_id} | utc_day={utc_day} | hits_before={hits_before} | threshold={threshold} | decision={decision} | now_utc={now_utc.isoformat()}")
 
         if not allowed:
+            # Log rate limit hit event
+            request_id = getattr(request.state, 'request_id', 'unknown')
+            log_event("rate_limit_hit", request_id=request_id, chat_id=req.chat_id, status=429)
+
+        if not allowed:
             # Log the 429 response for idempotency
             try:
                 await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours"}, request_id=request_id)
@@ -460,6 +513,9 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                 result = await compose_async(platform, req.text, str(req.chat_id), business_type=None, request_id=request_id, request=request)
                 break
             except asyncio.TimeoutError:
+                # Log LLM timeout event
+                request_id = getattr(request.state, 'request_id', 'unknown')
+                log_event("timeout_llm", request_id=request_id, chat_id=req.chat_id, llm_timeout_ms=LLM_TIMEOUT_S*1000, status=429)
                 # Catch asyncio.TimeoutError from compose_async and raise HTTPException(
                 # status_code=429,
                 # detail={"error": "limit_reached", "reset_at": "soon"}
@@ -467,7 +523,11 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                 log.info(f"LLM timeout for chat_id {req.chat_id}")
                 # Log the timeout response for idempotency
                 with db.DbTimer(request):
+                    # Adding DB timing measurement
+                    db_start = time.perf_counter()
                     await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
+                    db_elapsed = (time.perf_counter() - db_start) * 100.0
+                    add_db_ms(request, db_elapsed)
                 
                 # Also cache the timeout response by content for consistency
                 if CONTENT_CACHE_ENABLED:
@@ -488,7 +548,11 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                         log.info(f"LLM rate limit reached after retries for chat_id {req.chat_id}")
                         # Log the LLM 429 response for idempotency
                         with db.DbTimer(request):
+                            # Adding DB timing measurement
+                            db_start = time.perf_counter()
                             await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
+                            db_elapsed = (time.perf_counter() - db_start) * 1000.0
+                            add_db_ms(request, db_elapsed)
                         
                         # Also cache the LLM 429 response by content for consistency
                         if CONTENT_CACHE_ENABLED:
@@ -502,7 +566,11 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
 
         # Atomically increment rate limit after successful LLM call
         with db.DbTimer(request):
+            # Adding DB timing measurement
+            db_start = time.perf_counter()
             increment_success = await db.increment_rate_limit(req.chat_id, utc_day, threshold)
+            db_elapsed = (time.perf_counter() - db_start) * 1000.0
+            add_db_ms(request, db_elapsed)
 
         if not increment_success:
             log.warning(f"Failed to increment rate limit for chat_id={req.chat_id}, utc_day={utc_day}")

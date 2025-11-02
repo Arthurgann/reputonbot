@@ -331,3 +331,60 @@ fc.exe a.json b.json # различий быть не должно
 - `chat_state_updated_at_idx` — TTL-проверки выбора платформы.
 - `rate_limits: chat_id_idx` — быстрый счётчик на пользователя/день.
 
+## Observability (lite)
+
+Включается одной переменной окружения:
+
+- `LOG_JSON=1` — логгер `reputonbot` пишет строго JSON-события:
+  `debug_startup`, `compose_start`, `compose_done`, `rate_limit_hit`, `invalid_input`, `timeout_llm`.
+
+Каждый HTTP-ответ содержит заголовки таймингов:
+- `X-Request-ID`, `X-Elapsed-ms`, `X-DB-ms`, `X-LLM-ms`.
+
+### Режим профилирования (с логом в файл)
+**PowerShell (Windows):**
+```powershell
+$env:LOG_JSON="1"
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 --env-file .env 2>&1 |
+  Tee-Object -FilePath .\uvicorn.log
+
+LOG_JSON=1 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 --env-file .env 2>&1 | tee ./uvicorn.log
+В обычной работе запускайте короче (без логирования в файл):
+uvicorn backend.main:app --host 0.0.0.0 --port 8000 --env-file .env
+
+Быстрый бенч в PowerShell
+
+Отправляем 8 запросов и затем разбираем compose_done:
+$BASE="http://localhost:8000"; $CHAT=123
+curl "$BASE/state/set" -H "X-Request-ID: obs-lite-000" -H "Content-Type: application/json" -d "{""chat_id"":$CHAT,""platform"":""ozon""}" | Out-Null
+
+1..8 | % {
+  $rid="obs-lite-$($_)"; $body="{""chat_id"":$CHAT,""text"":""Тест $_""}"
+  curl "$BASE/compose_from_state" -H "X-Request-ID: $rid" -H "Content-Type: application/json" -d $body | Out-Null
+}
+
+Get-Content .\uvicorn.log |
+  Where-Object { $_ -match '"event":\s*"compose_done"' } |
+  Set-Content .\compose_done.jsonl
+
+Get-Content .\compose_done.jsonl |
+  ForEach-Object { $_ | ConvertFrom-Json } |
+  Select-Object ts, status, elapsed_ms, db_ms, llm_ms, request_id |
+  Format-Table -Auto
+
+Оценка:
+
+elapsed_ms — общее время запроса;
+
+db_ms — суммарное время БД в запросе;
+
+llm_ms — время LLM (если был вызов; при кэш-хите может быть ~0).
+
+FAQ
+
+Где берётся uvicorn.log? Создаётся только при запуске с Tee-Object/tee (режим профилирования).
+
+Будет ли он расти в проде? Нет, в обычном запуске файл не пишется. Для профилирования — да, зато его можно удалить.
+
+Нужно ли делать ротацию? Пока нет. Если потребуется — добавим позже (logrotate/size cap).
+

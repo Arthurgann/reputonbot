@@ -10,7 +10,7 @@ configure_json_logging()
 import os
 from backend.observability_lite import log_event
 
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="ReputonBot Backend", version=os.getenv("APP_VERSION", "0.1.0"))
@@ -257,25 +257,11 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     result["rules"] = rules
     result["instruction_template"] = instruction_template
 
-    # Log the interaction (moved after LLM call for performance)
-    if request:
-        with db.DbTimer(request):
-            # Adding DB timing measurement
-            db_start = time.perf_counter()
-            await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
-            db_elapsed = (time.perf_counter() - db_start) * 1000.0
-            add_db_ms(request, db_elapsed)
-    else:
-        try:
-            await db.log_interaction(chat_id, platform, text, result, request_id=request_id)
-        except Exception as e:
-            log.warning(f"log_interaction failed: {e}")
-
     return result
 
 
 @app.post("/compose", response_model=ComposeResponse)
-async def compose_endpoint(req: ComposeRequest, request: Request):
+async def compose_endpoint(req: ComposeRequest, request: Request, background: BackgroundTasks):
     try:
         # Extract X-Request-ID from headers
         request_id = request.headers.get("X-Request-ID")
@@ -308,13 +294,12 @@ async def compose_endpoint(req: ComposeRequest, request: Request):
         
         result = await compose_async(req.platform, req.text, req.tg_user_id, req.business_type, request_id=request_id, request=request)
         
-        # Log the interaction with request_id for idempotency
-        with db.DbTimer(request):
-            # Adding DB timing measurement
-            db_start = time.perf_counter()
-            await db.log_interaction(req.tg_user_id, req.platform, req.text, result, request_id=request_id)
-            db_elapsed = (time.perf_counter() - db_start) * 1000.0
-            add_db_ms(request, db_elapsed)
+        # Add background task to log interaction after getting result
+        background.add_task(
+            db.log_interaction,
+            req.tg_user_id, req.platform, req.text, result,
+            request_id=request_id
+        )
         
         # Also cache by content for future requests with different request_id but same content
         if CONTENT_CACHE_ENABLED:
@@ -380,7 +365,7 @@ def ensure_utc(dtval):
     return None
 
 @app.post("/compose_from_state", response_model=ComposeResponse)
-async def compose_from_state(req: ComposeFromStateRequest, request: Request):
+async def compose_from_state(req: ComposeFromStateRequest, request: Request, background: BackgroundTasks):
     """
     Compose response based on platform stored in chat state (fully async)
     """
@@ -491,11 +476,12 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
             log_event("rate_limit_hit", request_id=request_id, chat_id=req.chat_id, status=429)
 
         if not allowed:
-            # Log the 429 response for idempotency
-            try:
-                await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours"}, request_id=request_id)
-            except Exception as e:
-                log.warning(f"log_interaction failed: {e}")
+            # Log the 429 response for idempotency using background task
+            background.add_task(
+                db.log_interaction,
+                str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours"},
+                request_id=request_id
+            )
             
             # Also cache the 429 response by content for consistency
             if CONTENT_CACHE_ENABLED:
@@ -511,6 +497,14 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         for attempt in range(max_retries + 1):
             try:
                 result = await compose_async(platform, req.text, str(req.chat_id), business_type=None, request_id=request_id, request=request)
+                
+                # Add background task to log interaction after getting result
+                background.add_task(
+                    db.log_interaction,
+                    str(req.chat_id), platform, req.text, result,
+                    request_id=request_id
+                )
+                
                 break
             except asyncio.TimeoutError:
                 # Log LLM timeout event
@@ -521,13 +515,12 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                 # detail={"error": "limit_reached", "reset_at": "soon"}
                 # )
                 log.info(f"LLM timeout for chat_id {req.chat_id}")
-                # Log the timeout response for idempotency
-                with db.DbTimer(request):
-                    # Adding DB timing measurement
-                    db_start = time.perf_counter()
-                    await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
-                    db_elapsed = (time.perf_counter() - db_start) * 100.0
-                    add_db_ms(request, db_elapsed)
+                # Log the timeout response for idempotency using background task
+                background.add_task(
+                    db.log_interaction,
+                    str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"},
+                    request_id=request_id
+                )
                 
                 # Also cache the timeout response by content for consistency
                 if CONTENT_CACHE_ENABLED:
@@ -546,13 +539,12 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
                     else:
                         # After all retries, return a 429 with appropriate message
                         log.info(f"LLM rate limit reached after retries for chat_id {req.chat_id}")
-                        # Log the LLM 429 response for idempotency
-                        with db.DbTimer(request):
-                            # Adding DB timing measurement
-                            db_start = time.perf_counter()
-                            await db.log_interaction(str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"}, request_id=request_id)
-                            db_elapsed = (time.perf_counter() - db_start) * 1000.0
-                            add_db_ms(request, db_elapsed)
+                        # Log the LLM 429 response for idempotency using background task
+                        background.add_task(
+                            db.log_interaction,
+                            str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "soon"},
+                            request_id=request_id
+                        )
                         
                         # Also cache the LLM 429 response by content for consistency
                         if CONTENT_CACHE_ENABLED:
@@ -593,7 +585,7 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/webhook/n8n")
-async def n8n_webhook(request: Request):
+async def n8n_webhook(request: Request, background: BackgroundTasks):
     """
     Webhook endpoint for n8n to send complaint text and receive processed response
     Proxies to /compose endpoint for consistent processing
@@ -646,9 +638,12 @@ async def n8n_webhook(request: Request):
         # Use data from payload directly
         result = await compose_async(platform, complaint_text, tg_user_id, business_type=business_type, request_id=request_id, request=request)
         
-        # Log the interaction with request_id for idempotency
-        with db.DbTimer(request):
-            await db.log_interaction(tg_user_id, platform, complaint_text, result, request_id=request_id)
+        # Add background task to log interaction after getting result
+        background.add_task(
+            db.log_interaction,
+            tg_user_id, platform, complaint_text, result,
+            request_id=request_id
+        )
         
         # Cache successful response by content
         if CONTENT_CACHE_ENABLED:

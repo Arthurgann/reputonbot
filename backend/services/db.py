@@ -294,6 +294,20 @@ async def increment_rate_limit(chat_id: int | str, utc_day: str, threshold: int)
     except Exception as e:
         log.warning(f"increment_rate_limit unexpected error: {e}")
         return False
+def ratelimit_check_and_inc(chat_id: int, utc_day: str, threshold: int):
+    sb = get_client()
+    res = sb.rpc("rate_limit_check_and_inc", {
+        "p_chat_id": chat_id,
+        "p_day": utc_day,
+        "p_threshold": threshold
+    }).execute()
+    data = getattr(res, "data", None) or []
+    if data:
+        row = data[0]
+        return bool(row["allowed"]), int(row["hits_before"])
+    return False, 0
+
+
 
 def get_interaction_by_request_id(request_id: str) -> Optional[Dict[str, Any]]:
     """

@@ -464,34 +464,17 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request, bac
                 log.warning(f"Failed to check content cache: {e}")
                 # Continue without content caching
 
-        # Check rate limit (without increment)
-        with db.DbTimer(request):
-            hits_before, allowed = db.check_rate_limit(req.chat_id, utc_day, threshold)
+        allowed, hits_before = db.ratelimit_check_and_inc(req.chat_id, utc_day, threshold)
         decision = "ok" if allowed else "429"
         log.info(f"rate | chat_id={req.chat_id} | utc_day={utc_day} | hits_before={hits_before} | threshold={threshold} | decision={decision} | now_utc={now_utc.isoformat()}")
 
         if not allowed:
-            # Log rate limit hit event
-            request_id = getattr(request.state, 'request_id', 'unknown')
-            log_event("rate_limit_hit", request_id=request_id, chat_id=req.chat_id, status=429)
-
-        if not allowed:
-            # Log the 429 response for idempotency using background task
             background.add_task(
                 db.log_interaction,
-                str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours"},
+                str(req.chat_id), platform, req.text, {"error": "limit_reached", "reset_at": "24 hours" if not dev_mode else "soon"},
                 request_id=request_id
             )
-            
-            # Also cache the 429 response by content for consistency
-            if CONTENT_CACHE_ENABLED:
-                try:
-                    db.cache_request_by_content(req.chat_id, req.text, platform, {"error": "limit_reached", "reset_at": "24 hours"}, 429)
-                except Exception as e:
-                    log.warning(f"Failed to cache 429 response by content: {e}")
-            
-            reset_at = "soon" if dev_mode else "24 hours"
-            raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": reset_at})
+            raise HTTPException(status_code=429, detail={"error": "limit_reached", "reset_at": "24 hours" if not dev_mode else "soon"})
         # Call internal async compose function with retry logic for LLM rate limits
         max_retries = 2
         for attempt in range(max_retries + 1):
@@ -555,17 +538,6 @@ async def compose_from_state(req: ComposeFromStateRequest, request: Request, bac
                 else:
                     # Re-raise if it's not an LLM rate limit error
                     raise llm_error
-
-        # Atomically increment rate limit after successful LLM call
-        with db.DbTimer(request):
-            # Adding DB timing measurement
-            db_start = time.perf_counter()
-            increment_success = await db.increment_rate_limit(req.chat_id, utc_day, threshold)
-            db_elapsed = (time.perf_counter() - db_start) * 1000.0
-            add_db_ms(request, db_elapsed)
-
-        if not increment_success:
-            log.warning(f"Failed to increment rate limit for chat_id={req.chat_id}, utc_day={utc_day}")
 
         
         # Also cache by content for future requests with different request_id but same content

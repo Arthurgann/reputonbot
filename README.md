@@ -341,6 +341,15 @@ fc.exe a.json b.json # различий быть не должно
 Каждый HTTP-ответ содержит заголовки таймингов:
 - `X-Request-ID`, `X-Elapsed-ms`, `X-DB-ms`, `X-LLM-ms`.
 
+Rate-limit (atomic RPC)
+
+Проверка и инкремент лимита объединены в одну Supabase RPC-функцию rate_limit_check_and_inc(...)
+(см. sql/002_rate_limit_fn.sql).
+Схема: rate_limits(chat_id, utc_day) — UNIQUE.
+Ускоряет обработку на ~0.4–0.8 s и исключает гонки при параллельных запросах.
+При превышении возвращается 429 {"error":"limit_reached"}.
+Логи: rate | chat_id=... | hits_before=N | decision=ok|429.
+
 ### Режим профилирования (с логом в файл)
 **PowerShell (Windows):**
 ```powershell

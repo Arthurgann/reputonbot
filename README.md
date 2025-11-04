@@ -397,3 +397,64 @@ FAQ
 
 Нужно ли делать ротацию? Пока нет. Если потребуется — добавим позже (logrotate/size cap).
 
+## 🔒 Безопасность и прод-защита
+
+- Backend использует `SUPABASE_SERVICE_ROLE_KEY`, а не `SUPABASE_ANON_KEY` — доступ к БД идёт через безопасный сервисный ключ.
+- Включён RLS (Row Level Security) во всех таблицах Supabase.
+- Для таблицы `platform_rules` добавлена политика `SELECT USING (true)` — разрешено только чтение.
+- Все критические таблицы (`chat_state`, `interactions`, `rate_limits`, `request_cache`) закрыты для анонимных запросов.
+- Telegram-бот и эндпоинты `/state/set`, `/compose_from_state` работают стабильно после активации RLS.
+
+📄 Подробнее: [docs/SECURITY_P2.md](../docs/SECURITY_P2.md)
+
+# n8n Workflows — ReputonBot
+
+## Состав
+- **Telegram Trigger** → `Switch` → `Set (chat_id, text)`  
+  → `Send Message (⏳ Генерирую…)` → `Edit Fields (Set tele_ids)`  
+  → `HTTP /compose_from_state` → `IF (ошибка?)`  
+  → **YES** → `Edit Message (ошибка)`  
+  → **NO**  → `Edit Message (ответ)`
+
+## Импорт/экспорт
+- Экспортируй актуальные флоу в `n8n/flows/*.json`  
+  (Workflow → Export → **Include credentials: NO**).
+- Импорт: Workflow → Import from file.
+
+## Переменные/выражения (ключевые)
+
+**Edit Fields (Set tele_ids)**
+- `tele_msg_id = {{$json.result?.message_id || $json.message_id}}`
+- `tele_chat_id = {{$json.result?.chat?.id || $json.chat?.id || $json.message?.chat?.id || $json.chat_id}}`
+- (протаскиваем поля из `Set (chat_id, text)`)
+  - `chat_id = {{$node["Set (chat_id, text)"].json.chat_id}}`
+  - `text    = {{$node["Set (chat_id, text)"].json.text}}`
+
+**HTTP /compose_from_state**
+- Headers:
+  - `Content-Type: application/json`
+  - `X-Request-ID: {{$node["Set (chat_id, text)"].json.chat_id}}.{{$now}}`
+- Body:
+  - `chat_id = {{$node["Set (chat_id, text)"].json.chat_id}}`
+  - `text    = {{$node["Set (chat_id, text)"].json.text}}`
+
+**IF (ошибка?)** — условие:
+```js
+{{$json.statusCode && $json.statusCode >= 400}}
+||
+{{$json.body?.error != null}}
+||
+{{$json.body?.detail != null}}
+
+- `Edit Message (успех)`:
+- Chat: `={{$node["Edit Fields (Set tele_ids)"].json.tele_chat_id}}`
+- Msg:  `={{$node["Edit Fields (Set tele_ids)"].json.tele_msg_id}}`
+- Text: `={{$json.body?.complaint || $json.complaint}}`
+- `Edit Message (ошибка)`:
+- Chat/Msg — как выше
+- Text:  
+  `={{$json.body?.user_message || $json.user_message || "Сервис занят, попробуйте позже."}}`
+
+## Примечания
+- Включён флаг “Include Response Headers” у HTTP — тайминги доступны.
+- Markdown-режим у `Edit Message` отключён (plain text).

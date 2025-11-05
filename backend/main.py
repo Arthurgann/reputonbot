@@ -176,6 +176,10 @@ def healthz():
     
     return result
 
+@app.head("/healthz")
+async def healthz_head():
+    return Response(status_code=200)
+
 @app.get("/readyz")
 async def readyz():
     """

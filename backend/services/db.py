@@ -34,7 +34,7 @@ async def preload_platform_rules() -> None:
         sb = get_client()
         try:
             res = await asyncio.wait_for(
-                asyncio.to_thread(lambda: sb.table("platform_rules").select("platform, name, rules, instruction_template, tips, report_url, system_prompt, rules_version").execute()),
+                asyncio.to_thread(lambda: sb.table("platform_rules").select("platform, name, rules, instruction_template, tips, report_url, system_prompt, rules_version, upsell_block").execute()),
                 timeout=2.0
             )
         except asyncio.TimeoutError:
@@ -51,6 +51,7 @@ async def preload_platform_rules() -> None:
                 "report_url": row.get("report_url") or "",
                 "system_prompt": row.get("system_prompt") or "",
                 "rules_version": row.get("rules_version") or "",
+                "upsell_block": row.get("upsell_block")
             }
             _platform_rules_cache[row["platform"]] = platform_data
         print(f"Preloaded {len(_platform_rules_cache)} platform rules into cache")
@@ -91,7 +92,7 @@ async def get_platform_rules(platform: str) -> Dict[str, Any]:
     t0 = time.perf_counter()
     try:
         res = await asyncio.wait_for(
-            asyncio.to_thread(lambda: sb.table("platform_rules").select("platform, name, rules, instruction_template, tips, report_url, system_prompt, rules_version").eq("platform", platform).single().execute()),
+            asyncio.to_thread(lambda: sb.table("platform_rules").select("platform, name, rules, instruction_template, tips, report_url, system_prompt, rules_version, upsell_block").eq("platform", platform).single().execute()),
             timeout=2.0
         )
     except asyncio.TimeoutError:
@@ -112,6 +113,7 @@ async def get_platform_rules(platform: str) -> Dict[str, Any]:
         "report_url": row.get("report_url") or "",
         "system_prompt": row.get("system_prompt") or "",
         "rules_version": row.get("rules_version") or "",
+        "upsell_block": row.get("upsell_block")
     }
     return platform_data
 

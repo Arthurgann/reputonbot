@@ -229,6 +229,7 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     tips = platform_data["tips"]
     report_url = platform_data["report_url"]
     rules_version = platform_data["rules_version"]
+    upsell_block = platform_data["upsell_block"]
 
     # Calculate probability using heuristic function
     probability_label = score_probability(text, rules)
@@ -260,6 +261,7 @@ async def compose_async(platform: str, text: str, chat_id: Optional[str] = None,
     result["system_prompt"] = system_prompt
     result["rules"] = rules
     result["instruction_template"] = instruction_template
+    result["upsell_block"] = upsell_block
 
     return result
 

@@ -18,6 +18,7 @@ class ComposeResponse(BaseModel):
     system_prompt: Optional[str] = None
     rules: Optional[dict] = None
     instruction_template: Optional[str] = None
+    upsell_block: Optional[str] = None
 
 class StateSetRequest(BaseModel):
     chat_id: int

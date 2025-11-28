@@ -296,12 +296,13 @@ async def increment_rate_limit(chat_id: int | str, utc_day: str, threshold: int)
     except Exception as e:
         log.warning(f"increment_rate_limit unexpected error: {e}")
         return False
+MONTHLY_LIMIT = 10
+
 def ratelimit_check_and_inc(chat_id: int, utc_day: str, threshold: int):
     sb = get_client()
     res = sb.rpc("rate_limit_check_and_inc", {
         "p_chat_id": chat_id,
-        "p_day": utc_day,
-        "p_threshold": threshold
+        "p_max_hits": MONTHLY_LIMIT
     }).execute()
     data = getattr(res, "data", None) or []
     if data:

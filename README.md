@@ -79,13 +79,14 @@ The application uses Supabase as its database. The schema is defined in `supabas
 
 **interactions**: id, tg_user_id, platform, input_text, output_json, created_at, chat_id, request_id (NULL), meta_json (NULL)
 
-**rate_limits**: chat_id, utc_day, hits, threshold (без переименований в этом релизе)
+**rate_limits**: chat_id, utc_day, hits, threshold — utc_day хранит дату начала месяца (первое число в UTC) для месячного лимита (10 запросов на chat_id в месяц).
 
 **request_cache**: chat_id, text_hash, platform, response, status, created_at (без поля expires_at)
 
 **chat_state**: chat_id, platform, updated_at
 
-**platform_rules**: id, platform, system_prompt, rules, report_url, created_at
+**platform_rules**: id, platform, system_prompt, rules, report_url, created_at, upsell_block
+   #upsell_block — текстовый CTA-блок, возвращается в /compose_from_state.
 
 ### 🔧 Рекомендуемые поля и индексы (актуально, v0.1.1)
 
@@ -144,6 +145,21 @@ curl -X POST http://localhost:8000/compose_from_state \
   -H "Content-Type": "application/json" \
   -d '{"chat_id": 11222333, "text": "пользовательский текст"}'
 ```
+### Response fields (updated v0.1.2)
+
+```json
+{
+  "complaint": "...",
+  "instruction": "...",
+  "tips": ["..."],
+  "probability_label": "...",
+  "rules_version": "...",
+  "report_url": "...",
+  "system_prompt": "...",
+  "rules": { },
+  "instruction_template": "...",
+  "upsell_block": "..." 
+}
 
 ### Payload Examples
 
@@ -343,12 +359,21 @@ fc.exe a.json b.json # различий быть не должно
 
 Rate-limit (atomic RPC)
 
-Проверка и инкремент лимита объединены в одну Supabase RPC-функцию rate_limit_check_and_inc(...)
-(см. sql/002_rate_limit_fn.sql).
-Схема: rate_limits(chat_id, utc_day) — UNIQUE.
-Ускоряет обработку на ~0.4–0.8 s и исключает гонки при параллельных запросах.
-При превышении возвращается 429 {"error":"limit_reached"}.
-Логи: rate | chat_id=... | hits_before=N | decision=ok|429.
+Лимит: 10 запросов на chat_id в календарный месяц.
+
+Период определяется как date_trunc('month', now() at time zone 'utc') и сохраняется в rate_limits.utc_day. 
+Для каждого месяца создаётся отдельная запись с накопительным счётчиком hits.
+
+Ограничение реализовано через Supabase RPC-функцию:
+rate_limit_check_and_inc(p_chat_id bigint, p_max_hits integer)
+
+Функция атомарно увеличивает hits и возвращает:
+- allowed        — можно ли выполнять запрос
+- hits_before    — значение счётчика до инкремента
+- hits           — значение после инкремента
+
+Backend всегда передаёт p_max_hits = 10.
+Если allowed=false, backend отвечает HTTP 429 {"error":"limit_reached"}.
 
 ### Режим профилирования (с логом в файл)
 **PowerShell (Windows):**
@@ -450,6 +475,7 @@ FAQ
 - Chat: `={{$node["Edit Fields (Set tele_ids)"].json.tele_chat_id}}`
 - Msg:  `={{$node["Edit Fields (Set tele_ids)"].json.tele_msg_id}}`
 - Text: `={{$json.body?.complaint || $json.complaint}}`
+  `={{ $json.body.upsell_block }}
 - `Edit Message (ошибка)`:
 - Chat/Msg — как выше
 - Text:  
